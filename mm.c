@@ -215,6 +215,8 @@ void *malloc(size_t size)
       bt_make(pointer, blocksize, USED);
       word_t *nonused_pointer = (void *)pointer + blocksize;
       bt_make(nonused_pointer, nonused_size, FREE);
+      if (last == pointer)
+        last = nonused_pointer;
     }
   }
   return bt_payload(pointer);
@@ -233,12 +235,12 @@ void free(void *ptr)
   int this_last = (last == header);
 
   //fprintf(stderr, "%ld   %ld   %ld   %ld   %ld   %d\n", (long)heap_start, (long)last, (long)prev_header, (long)header, (long)next_header, (*header));
-  if (!this_last)
-    if (next_header && bt_free(next_header))
-    {
-      new_size += bt_size(next_header);
-      this_last = (last == next_header);
-    }
+
+  if (!this_last && next_header && bt_free(next_header))
+  {
+    new_size += bt_size(next_header);
+    this_last = (last == next_header);
+  }
 
   if (prev_header && bt_free(prev_header))
   {
@@ -273,36 +275,52 @@ void *realloc(void *old_ptr, size_t size)
   size_t blocksize = blksz(size);
   if (blocksize > bt_size(boundary))
   {
-    if (next_boundary && bt_free(next_boundary) && bt_size(boundary) + bt_size(next_boundary) - blocksize >= 0)
+    if (next_boundary && bt_free(next_boundary) && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
     {
+      //fprintf(stderr, "%d %d %ld %ld %d", bt_size(boundary), bt_size(next_boundary), blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize >= 0);
       size_t nonused_size = bt_size(boundary) + bt_size(next_boundary) - blocksize;
       if (nonused_size < ALIGNMENT)
+      {
+        if (last == next_boundary)
+          last = boundary;
         bt_make(boundary, nonused_size + blocksize, USED);
+      }
       else
       {
         bt_make(boundary, blocksize, USED);
         word_t *nonused_pointer = (void *)boundary + blocksize;
         bt_make(nonused_pointer, nonused_size, FREE);
+        if (last == next_boundary)
+          last = nonused_pointer;
       }
       return old_ptr;
     }
     else //nastepny block za maly lub go nie ma, i musimy przeniesc nasz blok gdzie indziej
     {
+      //MOZNA ZOPTYMALIZOWAC
       void *new_ptr = malloc(size);
       if (!new_ptr)
         return NULL;
-      memcpy(new_ptr, old_ptr, bt_size(boundary) - sizeof(word_t));
+      memcpy(new_ptr, old_ptr, bt_size(boundary) - (sizeof(word_t) << 1));
       free(old_ptr);
       return new_ptr;
     }
   }
-  else if (blocksize < bt_size(boundary)) // oraz blocksize >= ALIGNMENT
+  else if (blocksize < bt_size(boundary)) // oraz oczywiscie blocksize >= ALIGNMENT
   {
     bt_make(boundary, blocksize, USED);
     if (next_boundary && bt_free(next_boundary))
+    {
+      if (last == next_boundary)
+        last = boundary + blocksize;
       bt_make(boundary + blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE);
+    }
     else //zauwazmy, ze bt_size(boundary)-blocksize jest wielkosci co najmniej ALIGMENT, bo kazdy z nich jest wielokrotnoscia ALIGMENT
+    {
+      if (last == boundary)
+        last = boundary + blocksize;
       bt_make(boundary + blocksize, bt_size(boundary) - blocksize, FREE);
+    }
     return old_ptr;
   }
   else
@@ -324,7 +342,35 @@ void *calloc(size_t nmemb, size_t size)
 
 void mm_checkheap(int verbose)
 {
+  //wersja dla programu tylko z boundary tagami
+  // verbose moze byc rowne 0,1,2
+  void *prev_i = NULL;
+  int counter = 0;
+  for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i))
+  {
+    if (bt_payload(i) >= (void *)heap_end)
+      msg("[%d] CHECKHEAP ERROR: PAYLOAD OUTSIDE HEAP\n", counter);
+
+    if (bt_footer(i) >= heap_end)
+      msg("[%d] CHECKHEAP ERROR: FOOTER OUTSIDE HEAP\n", counter);
+
+    if (bt_size(i) % 16)
+      msg("[%d] CHECKHEAP ERROR: SIZE NOT DIVISIBLE BY 16\n", counter);
+
+    if (prev_i && bt_free(prev_i) && bt_free(i))
+      msg("[%d] [%d] CHECKHEAP ERROR: TWO FREE BLOCKS ADJACENT\n", counter - 1, counter);
+
+    prev_i = i;
+    counter++;
+  }
+
   if (verbose)
   {
+    msg("HEAP STRUCTURE\n");
+    msg("last:%ld heap_end:%ld\n", (void *)last - (void *)heap_start, (void *)heap_end - (void *)heap_start);
+    counter = 0;
+    for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i), counter++)
+      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld\n", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start);
+    msg("-------------------------------------------\n");
   }
 }
