@@ -132,7 +132,9 @@ static inline size_t blksz(size_t size)
   if (payload_and_footer % ALIGNMENT == 0)
     return payload_and_footer + ALIGNMENT; //header + payload + footer + padding (wielkosci aligmnent minus jedno slowo)
   else if (payload_and_footer % ALIGNMENT == ALIGNMENT - sizeof(word_t))
-    return sizeof(word_t) + payload_and_footer; //header + payload + footer
+    return sizeof(word_t) + payload_and_footer; //header + payload + footer + padding
+  else if (payload_and_footer % ALIGNMENT > ALIGNMENT - sizeof(word_t))
+    return payload_and_footer + ALIGNMENT - payload_and_footer % ALIGNMENT + ALIGNMENT;
   else
     return sizeof(word_t) + payload_and_footer + ALIGNMENT - payload_and_footer % ALIGNMENT - sizeof(word_t);
 }
@@ -169,7 +171,6 @@ static word_t *find_fit(size_t reqsz)
   word_t *pointer = heap_start;
   while (1)
   {
-    msg("%ld \n", (long)pointer);
     if (bt_free(pointer))
     {
       if (bt_size(pointer) >= reqsz)
@@ -178,7 +179,6 @@ static word_t *find_fit(size_t reqsz)
     pointer = bt_next(pointer);
     if (!pointer)
     {
-      msg("-----------------------------\n");
       return NULL;
     }
   }
@@ -192,7 +192,6 @@ static word_t *find_fit(size_t reqsz)
 
 void *malloc(size_t size)
 {
-  msg("trutu\n");
   size_t blocksize = blksz(size);
   word_t *pointer = find_fit(blocksize);
   if (pointer == NULL)
@@ -209,7 +208,7 @@ void *malloc(size_t size)
   else // pointer!=NULL
   {
     size_t nonused_size = bt_size(pointer) - blocksize;
-    if (nonused_size < ALIGNMENT + sizeof(word_t))
+    if (nonused_size < ALIGNMENT)
       bt_make(pointer, bt_size(pointer), USED);
     else
     {
@@ -225,13 +224,89 @@ void *malloc(size_t size)
 
 void free(void *ptr)
 {
+  if (ptr == NULL)
+    return;
+  word_t *header = bt_fromptr(ptr);
+  size_t new_size = bt_size(header);
+  word_t *prev_header = bt_prev(header);
+  word_t *next_header = bt_next(header);
+  int this_last = (last == header);
+
+  //fprintf(stderr, "%ld   %ld   %ld   %ld   %ld   %d\n", (long)heap_start, (long)last, (long)prev_header, (long)header, (long)next_header, (*header));
+  if (!this_last)
+    if (next_header && bt_free(next_header))
+    {
+      new_size += bt_size(next_header);
+      this_last = (last == next_header);
+    }
+
+  if (prev_header && bt_free(prev_header))
+  {
+    new_size += bt_size(prev_header);
+    header = prev_header;
+  }
+
+  if (this_last)
+    last = header;
+
+  bt_make(header, new_size, FREE);
 }
 
 /* --=[ realloc ]=---------------------------------------------------------- */
 
 void *realloc(void *old_ptr, size_t size)
 {
-  return NULL;
+  if (old_ptr == NULL && size != 0)
+    return malloc(size);
+
+  if (old_ptr == NULL && size == 0)
+    return NULL;
+
+  if (old_ptr != NULL && size < ALIGNMENT)
+  {
+    free(old_ptr);
+    return NULL;
+  }
+
+  word_t *boundary = bt_fromptr(old_ptr);
+  word_t *next_boundary = bt_next(boundary);
+  size_t blocksize = blksz(size);
+  if (blocksize > bt_size(boundary))
+  {
+    if (next_boundary && bt_free(next_boundary) && bt_size(boundary) + bt_size(next_boundary) - blocksize >= 0)
+    {
+      size_t nonused_size = bt_size(boundary) + bt_size(next_boundary) - blocksize;
+      if (nonused_size < ALIGNMENT)
+        bt_make(boundary, nonused_size + blocksize, USED);
+      else
+      {
+        bt_make(boundary, blocksize, USED);
+        word_t *nonused_pointer = (void *)boundary + blocksize;
+        bt_make(nonused_pointer, nonused_size, FREE);
+      }
+      return old_ptr;
+    }
+    else //nastepny block za maly lub go nie ma, i musimy przeniesc nasz blok gdzie indziej
+    {
+      void *new_ptr = malloc(size);
+      if (!new_ptr)
+        return NULL;
+      memcpy(new_ptr, old_ptr, bt_size(boundary) - sizeof(word_t));
+      free(old_ptr);
+      return new_ptr;
+    }
+  }
+  else if (blocksize < bt_size(boundary)) // oraz blocksize >= ALIGNMENT
+  {
+    bt_make(boundary, blocksize, USED);
+    if (next_boundary && bt_free(next_boundary))
+      bt_make(boundary + blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE);
+    else //zauwazmy, ze bt_size(boundary)-blocksize jest wielkosci co najmniej ALIGMENT, bo kazdy z nich jest wielokrotnoscia ALIGMENT
+      bt_make(boundary + blocksize, bt_size(boundary) - blocksize, FREE);
+    return old_ptr;
+  }
+  else
+    return old_ptr;
 }
 
 /* --=[ calloc ]=----------------------------------------------------------- */
@@ -249,4 +324,7 @@ void *calloc(size_t nmemb, size_t size)
 
 void mm_checkheap(int verbose)
 {
+  if (verbose)
+  {
+  }
 }

@@ -169,7 +169,6 @@ static word_t *find_fit(size_t reqsz)
   word_t *pointer = heap_start;
   while (1)
   {
-    msg("%ld \n", (long)pointer);
     if (bt_free(pointer))
     {
       if (bt_size(pointer) >= reqsz)
@@ -178,7 +177,6 @@ static word_t *find_fit(size_t reqsz)
     pointer = bt_next(pointer);
     if (!pointer)
     {
-      msg("-----------------------------\n");
       return NULL;
     }
   }
@@ -192,7 +190,6 @@ static word_t *find_fit(size_t reqsz)
 
 void *malloc(size_t size)
 {
-  msg("trutu\n");
   size_t blocksize = blksz(size);
   word_t *pointer = find_fit(blocksize);
   if (pointer == NULL)
