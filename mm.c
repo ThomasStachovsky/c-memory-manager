@@ -192,6 +192,8 @@ static word_t *find_fit(size_t reqsz)
 
 void *malloc(size_t size)
 {
+
+  //TODO: MONA OPTMALIZOWAC PRYPADKE ZE OSTATNI BLOK JEST PUSTY I ZA MALY
   size_t blocksize = blksz(size);
   word_t *pointer = find_fit(blocksize);
   if (pointer == NULL)
@@ -297,7 +299,7 @@ void *realloc(void *old_ptr, size_t size)
     }
     else //nastepny block za maly lub go nie ma, i musimy przeniesc nasz blok gdzie indziej
     {
-      //MOZNA ZOPTYMALIZOWAC
+      //TODO: MOZNA ZOPTYMALIZOWAC
       void *new_ptr = malloc(size);
       if (!new_ptr)
         return NULL;
