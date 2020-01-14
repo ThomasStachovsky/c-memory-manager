@@ -194,6 +194,8 @@ void *malloc(size_t size)
 {
 
   //TODO: MONA OPTMALIZOWAC PRYPADKE ZE OSTATNI BLOK JEST PUSTY I ZA MALY
+
+  //TODO: MOZNA BY ZROBIC OSOBNA LISTE NA MALE BLOKI NP DO 32B
   size_t blocksize = blksz(size);
   word_t *pointer = find_fit(blocksize);
   if (pointer == NULL)
