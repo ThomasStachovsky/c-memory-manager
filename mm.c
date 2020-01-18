@@ -120,7 +120,7 @@ static inline void bt_make(word_t *bt, size_t size, bt_flags flags, word_t off_p
 {
   (*bt) = size | flags;
   (*bt_footer(bt)) = size | flags;
-  if ((flags & FREE) == FREE)
+  if (flags == FREE)
   {
     *(bt + 1) = off_prev;
     *(bt + 2) = off_next;
@@ -217,22 +217,14 @@ int mm_init(void)
 /* First fit startegy. */
 static word_t *find_fit(size_t reqsz)
 {
-  if (!heap_start)
-    return NULL;
-  word_t *pointer = heap_start;
-  while (1)
+  word_t *pointer = list_start;
+  while (pointer)
   {
-    if (bt_free(pointer))
-    {
-      if (bt_size(pointer) >= reqsz)
-        return pointer;
-    }
-    pointer = bt_next(pointer);
-    if (!pointer)
-    {
-      return NULL;
-    }
+    if (bt_size(pointer) >= reqsz)
+      return pointer;
+    pointer = ls_next(pointer) ? ls_addrfromoff(ls_next(pointer)) : NULL;
   }
+  return NULL;
 }
 #else
 /* Best fit startegy. */
@@ -317,7 +309,7 @@ void free(void *ptr)
   if (next_is_free && prev_is_free)
   {
     if (next_header == last)
-      last = header;
+      last = prev_header;
     if (ls_addrfromoff(ls_next(prev_header)) == next_header) // ? -> prev_header -> next_header -> ?
     {
       if (prev_header == list_start && next_header == list_last) // prev_header -> next_header
@@ -602,7 +594,7 @@ void *realloc(void *old_ptr, size_t size)
         last = boundary + blocksize;
       word_t next_boundary_prev = ls_prev(next_boundary);
       word_t next_boundary_next = ls_next(next_boundary);
-      word_t *nonused_pointer = boundary + blocksize;
+      word_t *nonused_pointer = (void *)boundary + blocksize;
       bt_make(nonused_pointer, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE, next_boundary_prev, next_boundary_next);
       if (next_boundary_prev)
         ls_set_next(ls_addrfromoff(next_boundary_prev), ls_offfromaddr(nonused_pointer));
@@ -615,7 +607,7 @@ void *realloc(void *old_ptr, size_t size)
     }
     else //zauwazmy, ze bt_size(boundary)-blocksize jest wielkosci co najmniej ALIGMENT, bo kazdy z nich jest wielokrotnoscia ALIGMENT
     {
-      word_t *new_block = boundary + blocksize;
+      word_t *new_block = (void *)boundary + blocksize;
       if (last == boundary)
         last = new_block;
       word_t new_block_prev;
@@ -631,6 +623,9 @@ void *realloc(void *old_ptr, size_t size)
         ls_set_next(ls_addrfromoff(new_block_prev), ls_offfromaddr(new_block));
       else
         list_start = new_block;
+
+      //msg("%ld   %ld\n", (long)boundary, (long)new_block);
+      msg("%d\n", (*boundary));
     }
     return old_ptr;
   }
