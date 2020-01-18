@@ -41,13 +41,53 @@ typedef enum
   PREVFREE = 2, /* Previous block is free (optimized boundary tags) */
 } bt_flags;
 
+static word_t *heap_zero;  /* Address of the first byte ever returned from mem_sbrk() */
 static word_t *heap_start; /* Address of the first block */
 static word_t *heap_end;   /* Address past last byte of last block */
 static word_t *last;       /* Points at last block */
 
+//wersja bez kubelkow!!!!!!!!!
+static word_t *list_start; /* Address of the first free block */
+static word_t *list_last;  /* Address of the last free block */
+
+/* List of free blocks aux functions */
+
+//It returns an offset!!!
+static inline word_t ls_prev(word_t *ptr)
+{
+  return *(ptr + 1);
+}
+
+//It returns an offset!!!
+static inline word_t ls_next(word_t *ptr)
+{
+  return *(ptr + 2);
+}
+
+static inline void ls_set_prev(word_t *ptr, word_t offset)
+{
+  *(ptr + 1) = offset;
+}
+
+static inline void ls_set_next(word_t *ptr, word_t offset)
+{
+  *(ptr + 2) = offset;
+}
+
+static inline word_t *ls_addrfromoff(word_t offset)
+{
+  return (word_t *)((void *)heap_zero + (uint64_t)offset);
+}
+
+static inline word_t ls_offfromaddr(word_t *pointer)
+{
+  return (word_t)(uint64_t)((void *)pointer - (uint64_t)heap_zero);
+}
+
 /* --=[ boundary tag handling ]=-------------------------------------------- */
 
-static inline word_t bt_size(word_t *bt)
+static inline word_t
+bt_size(word_t *bt)
 {
   return *bt & ~(USED | PREVFREE);
 }
@@ -75,10 +115,16 @@ static inline word_t *bt_fromptr(void *ptr)
 }
 
 /* Creates boundary tag(s) for given block. */
-static inline void bt_make(word_t *bt, size_t size, bt_flags flags)
+/* Added functionality: Sets the prev and next offsets in a block if it is marked as free */
+static inline void bt_make(word_t *bt, size_t size, bt_flags flags, word_t off_prev, word_t off_next)
 {
   (*bt) = size | flags;
   (*bt_footer(bt)) = size | flags;
+  if ((flags & FREE) == FREE)
+  {
+    *(bt + 1) = off_prev;
+    *(bt + 2) = off_next;
+  }
 }
 
 /* Previous block free flag handling for optimized boundary tags. */
@@ -151,12 +197,17 @@ static void *morecore(size_t size)
 
 int mm_init(void)
 {
+  //void *ptr = morecore(3 * ALIGNMENT - sizeof(word_t);
   void *ptr = morecore(ALIGNMENT - sizeof(word_t));
   if (!ptr)
     return -1;
   heap_start = NULL;
+  heap_zero = ptr;
+  //heap_zero = ptr - 3*ALIGNMENT + sizeof(word_t);
   heap_end = NULL;
   last = NULL;
+  list_start = NULL;
+  list_last = NULL;
   return 0;
 }
 
@@ -207,18 +258,43 @@ void *malloc(size_t size)
       heap_start = pointer;
     last = pointer;
     heap_end = (void *)pointer + blocksize;
-    bt_make(pointer, blocksize, USED);
+    bt_make(pointer, blocksize, USED, 0, 0);
   }
   else // pointer!=NULL
   {
     size_t nonused_size = bt_size(pointer) - blocksize;
+    word_t freeblock_offset_prev = ls_prev(pointer);
+    word_t freeblock_offset_next = ls_next(pointer);
     if (nonused_size < ALIGNMENT)
-      bt_make(pointer, bt_size(pointer), USED);
+    {
+      if (freeblock_offset_prev)
+        ls_set_next(ls_addrfromoff(freeblock_offset_prev), freeblock_offset_next);
+      else if (freeblock_offset_next)
+        list_start = ls_addrfromoff(freeblock_offset_next);
+      else
+        list_start = NULL;
+      if (freeblock_offset_next)
+        ls_set_prev(ls_addrfromoff(freeblock_offset_next), freeblock_offset_prev);
+      else if (freeblock_offset_prev)
+        list_last = ls_addrfromoff(freeblock_offset_prev);
+      else
+        list_last = NULL;
+      bt_make(pointer, bt_size(pointer), USED, 0, 0);
+    }
     else
     {
-      bt_make(pointer, blocksize, USED);
+      bt_make(pointer, blocksize, USED, 0, 0);
       word_t *nonused_pointer = (void *)pointer + blocksize;
-      bt_make(nonused_pointer, nonused_size, FREE);
+      bt_make(nonused_pointer, nonused_size, FREE, freeblock_offset_prev, freeblock_offset_next);
+      if (freeblock_offset_prev)
+        ls_set_next(ls_addrfromoff(freeblock_offset_prev), ls_offfromaddr(nonused_pointer));
+      else
+        list_start = nonused_pointer;
+
+      if (freeblock_offset_next)
+        ls_set_prev(ls_addrfromoff(freeblock_offset_next), ls_offfromaddr(nonused_pointer));
+      else
+        list_last = nonused_pointer;
       if (last == pointer)
         last = nonused_pointer;
     }
@@ -236,26 +312,94 @@ void free(void *ptr)
   size_t new_size = bt_size(header);
   word_t *prev_header = bt_prev(header);
   word_t *next_header = bt_next(header);
+  int next_is_free = next_header && bt_free(next_header);
+  int prev_is_free = prev_header && bt_free(prev_header);
+  if (next_is_free && prev_is_free)
+  {
+  }
+  else if (next_is_free)
+  {
+  }
+  else if (prev_is_free)
+  {
+  }
+  else //no adjacent free blocks
+  {
+    if (list_start == NULL)
+    {
+      list_start = header;
+      list_last = header;
+      bt_make(header, new_size, FREE, 0, 0);
+    }
+  }
+  /*
+  word_t offset_next = 0;
+  word_t offset_prev;
+  if (list_last)
+    offset_prev = ls_offfromaddr(list_last);
+  else
+  {
+    offset_prev = 0;
+    list_start = header;
+    list_last = header;
+  }
   int this_last = (last == header);
+  int merged_with_next = 0;
+  int merged_with_prev = 0;
 
   //fprintf(stderr, "%ld   %ld   %ld   %ld   %ld   %d\n", (long)heap_start, (long)last, (long)prev_header, (long)header, (long)next_header, (*header));
 
   if (!this_last && next_header && bt_free(next_header))
   {
     new_size += bt_size(next_header);
+    offset_prev = ls_prev(next_header);
+    offset_next = ls_next(next_header);
     this_last = (last == next_header);
+    word_t next_header_prev = ls_prev(next_header);
+    word_t next_header_next = ls_next(next_header);
+    if (next_header_prev)
+      ls_set_next(ls_addrfromoff(next_header_prev), ls_offfromaddr(header));
+    else
+      list_start = header;
+
+    if (next_header_next)
+      ls_set_prev(ls_addrfromoff(next_header_next), ls_offfromaddr(header));
+    else
+      list_last = header;
+    merged_with_next = 1;
   }
 
   if (prev_header && bt_free(prev_header))
   {
     new_size += bt_size(prev_header);
+    offset_prev = ls_prev(prev_header);
+    if (!merged_with_next)
+      offset_next = ls_next(prev_header);
     header = prev_header;
+    word_t prev_header_prev = ls_prev(prev_header);
+    word_t prev_header_next = ls_next(prev_header);
+    if (prev_header_prev)
+      ls_set_next(ls_addrfromoff(prev_header_prev), ls_offfromaddr(header));
+    else
+      list_start = header;
+
+    if (prev_header_next)
+      ls_set_prev(ls_addrfromoff(prev_header_next), ls_offfromaddr(header));
+    else
+      list_last = header;
+    merged_with_prev = 1;
   }
 
   if (this_last)
     last = header;
 
-  bt_make(header, new_size, FREE);
+  if (!merged_with_next && !merged_with_prev)
+  {
+    ls_set_next(list_last, ls_offfromaddr(header)); //wiemy, ze list_last != NULL, bo sprawdzilismy to na poczatku funkcji 'free'
+    list_last = header;
+  }
+  bt_make(header, new_size, FREE, offset_prev, offset_next);
+  */
 }
 
 /* --=[ realloc ]=---------------------------------------------------------- */
@@ -283,17 +427,37 @@ void *realloc(void *old_ptr, size_t size)
     {
       //fprintf(stderr, "%d %d %ld %ld %d", bt_size(boundary), bt_size(next_boundary), blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize >= 0);
       size_t nonused_size = bt_size(boundary) + bt_size(next_boundary) - blocksize;
+      word_t next_boundary_prev = ls_prev(next_boundary);
+      word_t next_boundary_next = ls_next(next_boundary);
       if (nonused_size < ALIGNMENT)
       {
         if (last == next_boundary)
           last = boundary;
-        bt_make(boundary, nonused_size + blocksize, USED);
+        if (next_boundary_prev)
+          ls_set_next(ls_addrfromoff(next_boundary_prev), next_boundary_next);
+        else if (next_boundary_next)
+          list_start = ls_addrfromoff(next_boundary_next);
+        if (next_boundary_next)
+          ls_set_prev(ls_addrfromoff(next_boundary_next), next_boundary_prev);
+        else if (next_boundary_prev)
+          list_last = ls_addrfromoff(next_boundary_prev);
+        else
+          list_last = NULL;
+        bt_make(boundary, nonused_size + blocksize, USED, 0, 0);
       }
       else
       {
-        bt_make(boundary, blocksize, USED);
+        bt_make(boundary, blocksize, USED, 0, 0);
         word_t *nonused_pointer = (void *)boundary + blocksize;
-        bt_make(nonused_pointer, nonused_size, FREE);
+        bt_make(nonused_pointer, nonused_size, FREE, next_boundary_prev, next_boundary_next);
+        if (next_boundary_prev)
+          ls_set_next(ls_addrfromoff(next_boundary_prev), ls_offfromaddr(nonused_pointer));
+        else
+          list_start = nonused_pointer;
+        if (next_boundary_next)
+          ls_set_prev(ls_addrfromoff(next_boundary_next), ls_offfromaddr(nonused_pointer));
+        else
+          list_last = nonused_pointer;
         if (last == next_boundary)
           last = nonused_pointer;
       }
@@ -312,18 +476,42 @@ void *realloc(void *old_ptr, size_t size)
   }
   else if (blocksize < bt_size(boundary)) // oraz oczywiscie blocksize >= ALIGNMENT
   {
-    bt_make(boundary, blocksize, USED);
+    bt_make(boundary, blocksize, USED, 0, 0);
     if (next_boundary && bt_free(next_boundary))
     {
       if (last == next_boundary)
         last = boundary + blocksize;
-      bt_make(boundary + blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE);
+      word_t next_boundary_prev = ls_prev(next_boundary);
+      word_t next_boundary_next = ls_next(next_boundary);
+      word_t *nonused_pointer = boundary + blocksize;
+      bt_make(nonused_pointer, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE, next_boundary_prev, next_boundary_next);
+      if (next_boundary_prev)
+        ls_set_next(ls_addrfromoff(next_boundary_prev), ls_offfromaddr(nonused_pointer));
+      else
+        list_start = nonused_pointer;
+      if (next_boundary_next)
+        ls_set_prev(ls_addrfromoff(next_boundary_next), ls_offfromaddr(nonused_pointer));
+      else
+        list_last = nonused_pointer;
     }
     else //zauwazmy, ze bt_size(boundary)-blocksize jest wielkosci co najmniej ALIGMENT, bo kazdy z nich jest wielokrotnoscia ALIGMENT
     {
+      word_t *new_block = boundary + blocksize;
       if (last == boundary)
-        last = boundary + blocksize;
-      bt_make(boundary + blocksize, bt_size(boundary) - blocksize, FREE);
+        last = new_block;
+      word_t new_block_prev;
+      if (list_last)
+        new_block_prev = ls_offfromaddr(list_last);
+      else
+        new_block_prev = 0;
+      word_t new_block_next = 0;
+      list_last = new_block;
+
+      bt_make(new_block, bt_size(boundary) - blocksize, FREE, new_block_prev, new_block_next);
+      if (new_block_prev)
+        ls_set_next(ls_addrfromoff(new_block_prev), ls_offfromaddr(new_block));
+      else
+        list_start = new_block;
     }
     return old_ptr;
   }
@@ -364,6 +552,17 @@ void mm_checkheap(int verbose)
     if (prev_i && bt_free(prev_i) && bt_free(i))
       msg("[%d] [%d] CHECKHEAP ERROR: TWO FREE BLOCKS ADJACENT\n", counter - 1, counter);
 
+    if (i == list_start && ls_prev(i) != 0)
+      msg("[%d] CHECKHEAP ERROR: FIRST ELEMENT OF THE FREE LIST HAS NONZERO PREV\n", counter);
+
+    if (i != list_start && ls_prev(i) == 0)
+      msg("[%d] CHECKHEAP ERROR: NONFIRST ELEMENT OF THE FREE LIST HAS ZERO PREV\n", counter);
+
+    if (i == list_last && ls_next(i) != 0)
+      msg("[%d] CHECKHEAP ERROR: LAST ELEMENT OF THE FREE LIST HAS NONZERO NEXT\n", counter);
+
+    if (i != list_last && ls_next(i) == 0)
+      msg("[%d] CHECKHEAP ERROR: NONLAST ELEMENT OF THE FREE LIST HAS ZERO NEXT\n", counter);
     prev_i = i;
     counter++;
   }
@@ -371,10 +570,11 @@ void mm_checkheap(int verbose)
   if (verbose)
   {
     msg("HEAP STRUCTURE\n");
-    msg("last:%ld heap_end:%ld\n", (void *)last - (void *)heap_start, (void *)heap_end - (void *)heap_start);
+    msg("hs-he:%ld\n", (uint64_t)((void *)heap_start - (uint64_t)heap_zero));
+    msg("last:%ld heap_end:%ld\nlist_start:%ld,list_last:%ld\nheap_zero:%ld\n", (void *)last - (void *)heap_start, (void *)heap_end - (void *)heap_start, (void *)list_start - (void *)heap_start, (void *)list_last - (void *)heap_start, (long int)heap_zero);
     counter = 0;
     for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i), counter++)
-      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld\n", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start);
+      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld,prev:%d,next:%d\n", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start, ls_prev(i), ls_next(i));
     msg("-------------------------------------------\n");
   }
 }
