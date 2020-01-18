@@ -316,12 +316,125 @@ void free(void *ptr)
   int prev_is_free = prev_header && bt_free(prev_header);
   if (next_is_free && prev_is_free)
   {
+    if (next_header == last)
+      last = header;
+    if (ls_addrfromoff(ls_next(prev_header)) == next_header) // ? -> prev_header -> next_header -> ?
+    {
+      if (prev_header == list_start && next_header == list_last) // prev_header -> next_header
+      {
+        //list_start = prev_header;
+        list_last = prev_header;
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, 0, 0);
+      }
+      else if (prev_header == list_start) // prev_header -> next_header -> ...
+      {
+        //list_start = prev_header;
+        ls_set_prev(ls_addrfromoff(ls_next(next_header)), ls_offfromaddr(prev_header));
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, 0, ls_next(next_header));
+      }
+      else if (next_header == list_last) // ... -> prev_header -> next_header
+      {
+        list_last = prev_header;
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, ls_prev(prev_header), 0);
+      }
+      else // ... -> prev_header -> next_header -> ...
+      {
+        ls_set_prev(ls_addrfromoff(ls_next(next_header)), ls_offfromaddr(prev_header));
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, ls_prev(prev_header), ls_next(next_header));
+      }
+    }
+    else if (ls_addrfromoff(ls_next(next_header)) == prev_header) // ? -> next_header -> prev_header -> ?
+    {
+      if (next_header == list_start && prev_header == list_last) // next_header -> prev_header
+      {
+        list_start = prev_header;
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, 0, 0);
+      }
+      else if (next_header == list_start) // next_header -> prev_header -> ...
+      {
+        list_start = prev_header;
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, 0, ls_next(prev_header));
+      }
+      else if (prev_header == list_last) // ... -> next_header -> prev_header
+      {
+        ls_set_next(ls_addrfromoff(ls_prev(next_header)), ls_offfromaddr(prev_header));
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, ls_prev(next_header), 0);
+      }
+      else // ... -> next_header -> prev_header -> ...
+      {
+        ls_set_next(ls_addrfromoff(ls_prev(next_header)), ls_offfromaddr(prev_header));
+        new_size += bt_size(next_header) + bt_size(prev_header);
+        bt_make(prev_header, new_size, FREE, ls_prev(next_header), ls_next(prev_header));
+      }
+    }
+    else // ? -> prev_header -> ?         ? -> next_header -> ?
+    {
+      if (next_header == list_start)
+      {
+        list_start = ls_addrfromoff(ls_next(next_header));
+        ls_set_prev(ls_addrfromoff(ls_next(next_header)), 0);
+      }
+      else if (next_header == list_last)
+      {
+        list_last = ls_addrfromoff(ls_prev(next_header));
+        ls_set_next(ls_addrfromoff(ls_prev(next_header)), 0);
+      }
+      else
+      {
+        ls_set_prev(ls_addrfromoff(ls_next(next_header)), ls_prev(next_header));
+        ls_set_next(ls_addrfromoff(ls_prev(next_header)), ls_next(next_header));
+      }
+
+      new_size += bt_size(prev_header) + bt_size(next_header);
+      bt_make(prev_header, new_size, FREE, ls_prev(prev_header), ls_next(prev_header));
+    }
   }
   else if (next_is_free)
   {
+    if (next_header == last)
+      last = header;
+    if (next_header == list_start && next_header == list_last)
+    {
+      list_start = header;
+      list_last = header;
+      new_size += bt_size(next_header);
+      bt_make(header, new_size, FREE, 0, 0);
+    }
+    else if (next_header == list_start)
+    {
+      list_start = header;
+      ls_set_prev(ls_addrfromoff(ls_next(next_header)), ls_offfromaddr(header));
+      new_size += bt_size(next_header);
+      bt_make(header, new_size, FREE, 0, ls_next(next_header));
+    }
+    else if (next_header == list_last)
+    {
+      list_last = header;
+      ls_set_next(ls_addrfromoff(ls_prev(next_header)), ls_offfromaddr(header));
+      new_size += bt_size(next_header);
+      bt_make(header, new_size, FREE, ls_prev(next_header), 0);
+    }
+    else //next_header is not last and not first in the free list
+    {
+      ls_set_prev(ls_addrfromoff(ls_next(next_header)), ls_offfromaddr(header));
+      ls_set_next(ls_addrfromoff(ls_prev(next_header)), ls_offfromaddr(header));
+      new_size += bt_size(next_header);
+      bt_make(header, new_size, FREE, ls_prev(next_header), ls_next(next_header));
+    }
   }
   else if (prev_is_free)
   {
+    if (header == last)
+      last = prev_header;
+    new_size += bt_size(prev_header);
+    bt_make(prev_header, new_size, FREE, ls_prev(prev_header), ls_next(prev_header));
   }
   else //no adjacent free blocks
   {
@@ -330,6 +443,12 @@ void free(void *ptr)
       list_start = header;
       list_last = header;
       bt_make(header, new_size, FREE, 0, 0);
+    }
+    else //list of free blocks is not empty
+    {
+      bt_make(header, new_size, FREE, ls_offfromaddr(list_last), 0);
+      ls_set_next(list_last, ls_offfromaddr(header));
+      list_last = header;
     }
   }
   /*
