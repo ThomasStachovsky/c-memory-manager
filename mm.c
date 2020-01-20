@@ -168,10 +168,13 @@ static inline word_t ls_offfromaddr(word_t *pointer)
 static inline int ls_indexfromsize(size_t size)
 {
   size >>= 4;
-  int index = 1;                           //index 0 zarezerwowany na bloki blokow 16B/32B
-  while ((size >>= 1) && index < maxindex) //index 10 - bloki o wielkosci rownej/wiekszej 8KB
+  long long index;
+  asm("bsr %1, %0\n"
+      : "=r"(index)
+      : "r"(size));
+  if (size - ((long long)1 << index) != 0)
     index++;
-  return index;
+  return index + 1 < maxindex ? index + 1 : maxindex;
 }
 
 static inline void ls_add(word_t *block)
@@ -299,17 +302,34 @@ void *malloc(size_t size)
   //TODO: MOZNA BY ZROBIC OSOBNA LISTE NA MALE BLOKI NP DO 32B
   size_t blocksize = blksz(size);
   word_t *pointer = find_fit(blocksize);
-  /*
   if (pointer == NULL)
   {
-    pointer = mem_sbrk(blocksize);
-    if ((long)pointer < 0)
-      return NULL;
-    if (!heap_start)
-      heap_start = pointer;
-    last = pointer;
-    heap_end = (void *)pointer + blocksize;
-    bt_make(pointer, blocksize, USED);
+    if (heap_start && bt_free(last))
+    { /*
+      pointer = mem_sbrk(blocksize);
+      heap_end = (void *)pointer + blocksize;
+      bt_make(pointer, blocksize, USED);
+      last = pointer;
+      return bt_payload(pointer);*/
+
+      ls_remove(last);
+      pointer = mem_sbrk(blocksize - bt_size(last));
+      pointer = (void *)pointer - bt_size(last);
+      heap_end = (void *)pointer + blocksize;
+      bt_make(pointer, blocksize, USED);
+      return bt_payload(pointer);
+    }
+    else
+    {
+      pointer = mem_sbrk(blocksize);
+      if ((long)pointer < 0)
+        return NULL;
+      if (!heap_start)
+        heap_start = pointer;
+      last = pointer;
+      heap_end = (void *)pointer + blocksize;
+      bt_make(pointer, blocksize, USED);
+    }
   }
   else // pointer!=NULL
   {
@@ -329,17 +349,7 @@ void *malloc(size_t size)
       if (last == pointer)
         last = nonused_pointer;
     }
-  }*/
-
-  pointer = mem_sbrk(blocksize);
-  if ((long)pointer < 0)
-    return NULL;
-  if (!heap_start)
-    heap_start = pointer;
-  last = pointer;
-  heap_end = (void *)pointer + blocksize;
-  bt_make(pointer, blocksize, USED);
-
+  }
   return bt_payload(pointer);
 }
 
@@ -399,7 +409,6 @@ void free(void *ptr)
 
 void *realloc(void *old_ptr, size_t size)
 {
-#if 0
   if (old_ptr == NULL && size != 0)
     return malloc(size);
 
@@ -414,50 +423,92 @@ void *realloc(void *old_ptr, size_t size)
 
   word_t *boundary = bt_fromptr(old_ptr);
   word_t *next_boundary = bt_next(boundary);
+  word_t *prev_boundary = bt_prev(boundary);
   size_t blocksize = blksz(size);
   if (blocksize > bt_size(boundary))
   {
-    if (next_boundary && bt_free(next_boundary) && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
+    if (next_boundary && bt_free(next_boundary) && next_boundary == last && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) < blocksize)
     {
-      //fprintf(stderr, "%d %d %ld %ld %d", bt_size(boundary), bt_size(next_boundary), blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize, bt_size(boundary) + bt_size(next_boundary) - blocksize >= 0);
+      ls_remove(next_boundary);
+      mem_sbrk(blocksize - (size_t)bt_size(boundary) - (size_t)bt_size(next_boundary));
+      heap_end += blocksize - (size_t)bt_size(boundary) - (size_t)bt_size(next_boundary);
+      last = boundary;
+      bt_make(boundary, blocksize, USED);
+      return old_ptr;
+    }
+    else if (next_boundary && bt_free(next_boundary) && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
+    {
       size_t nonused_size = bt_size(boundary) + bt_size(next_boundary) - blocksize;
-      word_t next_boundary_prev = ls_prev(next_boundary);
-      word_t next_boundary_next = ls_next(next_boundary);
       if (nonused_size < ALIGNMENT)
       {
         if (last == next_boundary)
           last = boundary;
-        if (next_boundary_prev)
-          ls_set_next(ls_addrfromoff(next_boundary_prev), next_boundary_next);
-        else if (next_boundary_next)
-          list_start = ls_addrfromoff(next_boundary_next);
-        if (next_boundary_next)
-          ls_set_prev(ls_addrfromoff(next_boundary_next), next_boundary_prev);
-        else if (next_boundary_prev)
-          list_last = ls_addrfromoff(next_boundary_prev);
-        else
-          list_last = NULL;
-        bt_make(boundary, nonused_size + blocksize, USED, 0, 0);
+        ls_remove(next_boundary);
+        bt_make(boundary, nonused_size + blocksize, USED);
       }
       else
       {
-        bt_make(boundary, blocksize, USED, 0, 0);
+        ls_remove(next_boundary);
+        bt_make(boundary, blocksize, USED);
         word_t *nonused_pointer = (void *)boundary + blocksize;
-        bt_make(nonused_pointer, nonused_size, FREE, next_boundary_prev, next_boundary_next);
-        if (next_boundary_prev)
-          ls_set_next(ls_addrfromoff(next_boundary_prev), ls_offfromaddr(nonused_pointer));
-        else
-          list_start = nonused_pointer;
-        if (next_boundary_next)
-          ls_set_prev(ls_addrfromoff(next_boundary_next), ls_offfromaddr(nonused_pointer));
-        else
-          list_last = nonused_pointer;
+        bt_make(nonused_pointer, nonused_size, FREE);
+        ls_add(nonused_pointer);
         if (last == next_boundary)
           last = nonused_pointer;
       }
       return old_ptr;
     }
-    else //nastepny block za maly lub go nie ma, i musimy przeniesc nasz blok gdzie indziej
+    else if (next_boundary && prev_boundary && bt_free(next_boundary) && bt_free(prev_boundary) && (size_t)bt_size(boundary) + (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
+    {
+      size_t nonused_size = bt_size(prev_boundary) + bt_size(boundary) + bt_size(next_boundary) - blocksize;
+      if (nonused_size < ALIGNMENT)
+      {
+        if (last == next_boundary)
+          last = prev_boundary;
+        ls_remove(prev_boundary);
+        ls_remove(next_boundary);
+        memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
+        bt_make(prev_boundary, blocksize + nonused_size, USED);
+      }
+      else
+      {
+        word_t *nonused_pointer = (void *)prev_boundary + blocksize;
+        ls_remove(prev_boundary);
+        ls_remove(next_boundary);
+        memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
+        bt_make(prev_boundary, blocksize, USED);
+        bt_make(nonused_pointer, nonused_size, FREE);
+        ls_add(nonused_pointer);
+        if (last == next_boundary)
+          last = nonused_pointer;
+      }
+      return bt_payload(prev_boundary);
+    }
+    else if (prev_boundary && bt_free(prev_boundary) && (size_t)bt_size(prev_boundary) + (size_t)bt_size(boundary) >= blocksize)
+    {
+      size_t nonused_size = bt_size(prev_boundary) + bt_size(boundary) - blocksize;
+      if (nonused_size < ALIGNMENT)
+      {
+        if (last == boundary)
+          last = prev_boundary;
+        ls_remove(prev_boundary);
+        memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
+        bt_make(prev_boundary, blocksize + nonused_size, USED);
+      }
+      else
+      {
+        word_t *nonused_pointer = (void *)prev_boundary + blocksize;
+        ls_remove(prev_boundary);
+        memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
+        bt_make(prev_boundary, blocksize, USED);
+        bt_make(nonused_pointer, nonused_size, FREE);
+        ls_add(nonused_pointer);
+        if (last == boundary)
+          last = nonused_pointer;
+      }
+      return bt_payload(prev_boundary);
+    }
+    else
     {
       //TODO: MOZNA ZOPTYMALIZOWAC
       void *new_ptr = malloc(size);
@@ -470,51 +521,27 @@ void *realloc(void *old_ptr, size_t size)
   }
   else if (blocksize < bt_size(boundary)) // oraz oczywiscie blocksize >= ALIGNMENT
   {
-    bt_make(boundary, blocksize, USED, 0, 0);
+    bt_make(boundary, blocksize, USED);
     if (next_boundary && bt_free(next_boundary))
     {
       if (last == next_boundary)
         last = boundary + blocksize;
-      word_t next_boundary_prev = ls_prev(next_boundary);
-      word_t next_boundary_next = ls_next(next_boundary);
       word_t *nonused_pointer = (void *)boundary + blocksize;
-      bt_make(nonused_pointer, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE, next_boundary_prev, next_boundary_next);
-      if (next_boundary_prev)
-        ls_set_next(ls_addrfromoff(next_boundary_prev), ls_offfromaddr(nonused_pointer));
-      else
-        list_start = nonused_pointer;
-      if (next_boundary_next)
-        ls_set_prev(ls_addrfromoff(next_boundary_next), ls_offfromaddr(nonused_pointer));
-      else
-        list_last = nonused_pointer;
+      bt_make(nonused_pointer, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE);
+      ls_add(nonused_pointer);
     }
     else //zauwazmy, ze bt_size(boundary)-blocksize jest wielkosci co najmniej ALIGMENT, bo kazdy z nich jest wielokrotnoscia ALIGMENT
     {
       word_t *new_block = (void *)boundary + blocksize;
       if (last == boundary)
         last = new_block;
-      word_t new_block_prev;
-      if (list_last)
-        new_block_prev = ls_offfromaddr(list_last);
-      else
-        new_block_prev = 0;
-      word_t new_block_next = 0;
-      list_last = new_block;
-
-      bt_make(new_block, bt_size(boundary) - blocksize, FREE, new_block_prev, new_block_next);
-      if (new_block_prev)
-        ls_set_next(ls_addrfromoff(new_block_prev), ls_offfromaddr(new_block));
-      else
-        list_start = new_block;
-
-      //msg("%ld   %ld\n", (long)boundary, (long)new_block);
-      msg("%d\n", (*boundary));
+      bt_make(new_block, bt_size(boundary) - blocksize, FREE);
+      ls_add(new_block);
     }
     return old_ptr;
   }
   else
-#endif
-  return old_ptr;
+    return old_ptr;
 }
 
 /* --=[ calloc ]=----------------------------------------------------------- */
@@ -532,6 +559,19 @@ void *calloc(size_t nmemb, size_t size)
 
 void mm_checkheap(int verbose)
 {
+
+  if (verbose)
+  {
+    msg("%d %d %d %ld", ls_indexfromsize(blksz(128)), ls_indexfromsize(blksz(112)), ls_indexfromsize(32), blksz(128));
+    msg("HEAP STRUCTURE\n");
+    msg("hs-he:%ld\n", (uint64_t)((void *)heap_start - (uint64_t)heap_zero));
+    msg("last:%ld heap_end:%ld\nheap_zero:%ld\n", (void *)last - (void *)heap_start, (void *)heap_end - (void *)heap_start, (long int)heap_zero);
+    int counter = 0;
+    for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i), counter++)
+      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld,prev:%d,next:%d,index:%d\n", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start, ls_prev(i), ls_next(i), ls_indexfromsize(bt_size(i)));
+    msg("-------------------------------------------\n");
+  }
+
   //wersja dla programu tylko z boundary tagami
   // verbose moze byc rowne 0,1,2
   void *prev_i = NULL;
@@ -565,16 +605,5 @@ void mm_checkheap(int verbose)
       */
     prev_i = i;
     counter++;
-  }
-
-  if (verbose)
-  {
-    msg("HEAP STRUCTURE\n");
-    msg("hs-he:%ld\n", (uint64_t)((void *)heap_start - (uint64_t)heap_zero));
-    msg("last:%ld heap_end:%ld\nheap_zero:%ld\n", (void *)last - (void *)heap_start, (void *)heap_end - (void *)heap_start, (long int)heap_zero);
-    counter = 0;
-    for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i), counter++)
-      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld,prev:%d,next:%d\n", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start, ls_prev(i), ls_next(i));
-    msg("-------------------------------------------\n");
   }
 }
