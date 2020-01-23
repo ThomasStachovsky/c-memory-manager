@@ -313,11 +313,10 @@ void *malloc(size_t size)
       return bt_payload(pointer);*/
 
       ls_remove(last);
-      pointer = mem_sbrk(blocksize - bt_size(last));
-      pointer = (void *)pointer - bt_size(last);
-      heap_end = (void *)pointer + blocksize;
-      bt_make(pointer, blocksize, USED);
-      return bt_payload(pointer);
+      mem_sbrk(blocksize - bt_size(last));
+      heap_end = (void *)heap_end + blocksize - bt_size(last);
+      bt_make(last, blocksize, USED);
+      return bt_payload(last);
     }
     else
     {
@@ -431,7 +430,7 @@ void *realloc(void *old_ptr, size_t size)
     {
       ls_remove(next_boundary);
       mem_sbrk(blocksize - (size_t)bt_size(boundary) - (size_t)bt_size(next_boundary));
-      heap_end += blocksize - (size_t)bt_size(boundary) - (size_t)bt_size(next_boundary);
+      heap_end = (void *)heap_end + blocksize - (size_t)bt_size(boundary) - (size_t)bt_size(next_boundary);
       last = boundary;
       bt_make(boundary, blocksize, USED);
       return old_ptr;
@@ -511,7 +510,8 @@ void *realloc(void *old_ptr, size_t size)
     else
     {
       //TODO: MOZNA ZOPTYMALIZOWAC
-      void *new_ptr = malloc(size);
+      size_t newsize = (size > 2 * bt_size(boundary) - 4 * sizeof(word_t)) ? size : 2 * bt_size(boundary) - 4 * sizeof(word_t);
+      void *new_ptr = malloc(newsize);
       if (!new_ptr)
         return NULL;
       memcpy(new_ptr, old_ptr, bt_size(boundary) - (sizeof(word_t) << 1));
@@ -521,6 +521,8 @@ void *realloc(void *old_ptr, size_t size)
   }
   else if (blocksize < bt_size(boundary)) // oraz oczywiscie blocksize >= ALIGNMENT
   {
+    if (blocksize >= bt_size(boundary) / 2)
+      return old_ptr;
     bt_make(boundary, blocksize, USED);
     if (next_boundary && bt_free(next_boundary))
     {
