@@ -36,9 +36,10 @@ typedef int32_t word_t; /* Heap is bascially an array of 4-byte words. */
 
 typedef enum
 {
-  FREE = 0,     /* Block is free */
-  USED = 1,     /* Block is used */
-  PREVFREE = 2, /* Previous block is free (optimized boundary tags) */
+  FREE = 0,               /* Block is free */
+  USED = 1,               /* Block is used */
+  CONTAINER = 2,          /* Block is a container */
+  FIRST_IN_CONTAINER = 4, /* Block is the first block in a container (used while checking whether to merge blocks or not) */
 } bt_flags;
 
 static word_t *heap_zero;  /* Address of the first byte ever returned from mem_sbrk() */
@@ -46,18 +47,15 @@ static word_t *heap_start; /* Address of the first block */
 static word_t *heap_end;   /* Address past last byte of last block */
 static word_t *last;       /* Points at last block */
 
-//wersja bez kubelkow!!!!!!!!!
-//static word_t *list_start; /* Address of the first free block */
-//static word_t *list_last;  /* Address of the last free block */
-
 static word_t *free_lists;
-static const int maxindex = 258;
+static const int maxindex = 25;
+static const int containerexponent = 5;
 
 /* --=[ boundary tag handling ]=-------------------------------------------- */
 
 static inline word_t bt_size(word_t *bt)
 {
-  return *bt & ~(USED | PREVFREE);
+  return ((*bt) >> 4) << 4;
 }
 
 static inline int bt_used(word_t *bt)
@@ -68,6 +66,26 @@ static inline int bt_used(word_t *bt)
 static inline int bt_free(word_t *bt)
 {
   return !(*bt & USED);
+}
+
+static inline int bt_container(word_t *bt)
+{
+  return *bt & CONTAINER;
+}
+
+static inline int bt_freecontainer(word_t *bt)
+{
+  return bt_container(bt) && bt_free(bt);
+}
+
+static inline int bt_usedcontainer(word_t *bt)
+{
+  return bt_container(bt) && bt_used(bt);
+}
+
+static inline int bt_first_in_container(word_t *bt)
+{
+  return *bt & FIRST_IN_CONTAINER;
 }
 
 /* Given boundary tag address calculate it's buddy address. */
@@ -83,28 +101,10 @@ static inline word_t *bt_fromptr(void *ptr)
 }
 
 /* Creates boundary tag(s) for given block. */
-/* Added functionality: Sets the prev and next offsets in a block if it is marked as free */
 static inline void bt_make(word_t *bt, size_t size, bt_flags flags)
 {
   (*bt) = size | flags;
   (*bt_footer(bt)) = size | flags;
-}
-
-/* Previous block free flag handling for optimized boundary tags. */
-static inline bt_flags bt_get_prevfree(word_t *bt)
-{
-  return *bt & PREVFREE;
-}
-
-static inline void bt_clr_prevfree(word_t *bt)
-{
-  if (bt)
-    *bt &= ~PREVFREE;
-}
-
-static inline void bt_set_prevfree(word_t *bt)
-{
-  *bt |= PREVFREE;
 }
 
 /* Returns address of payload. */
@@ -129,6 +129,11 @@ static inline word_t *bt_prev(word_t *bt)
   word_t *prevfooter = bt - 1;
   void *prevheader = (void *)prevfooter - bt_size(prevfooter) + sizeof(word_t);
   return prevheader;
+}
+
+static inline size_t bt_containersize(word_t *bt)
+{
+  return bt_size(bt) << containerexponent; // kontenery zawieraja po szesnascie blokow
 }
 
 /* Lists of free blocks aux functions */
@@ -167,10 +172,9 @@ static inline word_t ls_offfromaddr(word_t *pointer)
 
 static inline int ls_indexfromsize(size_t size)
 {
+  if (size <= 256)
+    return (size + ALIGNMENT - 1) >> 4; //return ceil(size/16);
 
-  //exponential version
-
-  /*
   size >>= 4;
   long long index;
   asm("bsr %1, %0\n"
@@ -178,21 +182,14 @@ static inline int ls_indexfromsize(size_t size)
       : "r"(size));
   if (size - ((long long)1 << index) != 0)
     index++;
-  return index + 1 < maxindex ? index + 1 : maxindex;
-  */
-
-  //linear version
-
-  int index = size >> 4;
-  if (index >= maxindex)
-    return maxindex;
-  else
-    return index;
+  return index + 12 < maxindex ? index + 12 : maxindex;
 }
 
-static inline void ls_add(word_t *block)
+static inline void ls_add(word_t *block, int index)
 {
-  int index = ls_indexfromsize(bt_size(block));
+  if (index == 0)
+    index = ls_indexfromsize(bt_size(block));
+
   if (free_lists[index] == 0) //pusta lista
   {
     word_t block_offset = ls_offfromaddr(block);
@@ -209,6 +206,9 @@ static inline void ls_add(word_t *block)
     ls_set_prev(block, ls_offfromaddr(last_elem));
     ls_set_next(last_elem, block_offset);
     ls_set_prev(first_elem, block_offset);
+
+    if (bt_container(block)) //bloki bedace w kontenerach maja pierwszenstwo dlatego wstawiam je na poczatek listy
+      free_lists[index] = block_offset;
   }
 }
 
@@ -235,6 +235,11 @@ static inline void ls_remove(word_t *block)
 }
 
 /* --=[ miscellanous procedures ]=------------------------------------------ */
+
+static inline size_t containersize(size_t size)
+{
+  return size << containerexponent;
+}
 
 /* Calculates block size incl. header, footer & payload,
  * and aligns it to block boundary (ALIGNMENT). */
@@ -263,11 +268,11 @@ static void *morecore(size_t size)
 
 int mm_init(void)
 {
-  void *ptr = morecore((maxindex + 1) * 4); //wczesniej bylo:   3 * ALIGNMENT - sizeof(word_t)
+  void *ptr = morecore(3 * ALIGNMENT - sizeof(word_t));
   if (!ptr)
     return -1;
   heap_start = NULL;
-  heap_zero = memset(ptr, 0, (maxindex + 1) * 4);
+  heap_zero = memset(ptr, 0, 3 * ALIGNMENT - sizeof(word_t));
   free_lists = heap_zero;
   heap_end = NULL;
   last = NULL;
@@ -276,36 +281,59 @@ int mm_init(void)
 
 /* --=[ malloc ]=----------------------------------------------------------- */
 
-#if 1
 /* First fit startegy. */
 static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie payloadu
 {
   int index = ls_indexfromsize(reqsz);
-  while (index <= maxindex)
-  {
-    if (free_lists[index] == 0)
+
+  if (reqsz > 256)
+    while (index <= maxindex)
     {
+      if (free_lists[index] == 0)
+      {
+        index++;
+        continue;
+      }
+      word_t *first_elem = ls_addrfromoff(free_lists[index]);
+      word_t *pointer = first_elem;
+      do
+        if (bt_size(pointer) >= reqsz)
+          return pointer;
+        else
+          pointer = ls_addrfromoff(ls_next(pointer));
+      while (pointer != first_elem);
       index++;
-      continue;
     }
-    word_t *first_elem = ls_addrfromoff(free_lists[index]);
-    word_t *pointer = first_elem;
-    do
-      if (bt_size(pointer) >= reqsz)
-        return pointer;
-      else
-        pointer = ls_addrfromoff(ls_next(pointer));
-    while (pointer != first_elem);
-    index++;
+  else //przypadek dla blokow o malych rozmiarach tj. tych, dla ktorych rozpatrujemy kontenery
+  {
+    if (free_lists[index] == 0) // nie znalezlismy bloku konkretnego rozmiaru, szukamy miejsca na kontener na bloki tego rozmiaru
+    {
+      reqsz = containersize(reqsz);
+      index = ls_indexfromsize(reqsz);
+      while (index <= maxindex)
+      {
+        if (free_lists[index] == 0)
+        {
+          index++;
+          continue;
+        }
+        word_t *first_elem = ls_addrfromoff(free_lists[index]);
+        word_t *last_elem = ls_addrfromoff(ls_prev(first_elem));
+        word_t *pointer = last_elem;
+        do
+          if (bt_size(pointer) >= reqsz)
+            return pointer;
+          else
+            pointer = ls_addrfromoff(ls_prev(pointer));
+        while (pointer != last_elem);
+        index++;
+      }
+    }
+    else
+      return ls_addrfromoff(free_lists[index]);
   }
   return NULL;
 }
-#else
-/* Best fit startegy. */
-static word_t *find_fit(size_t reqsz)
-{
-}
-#endif
 
 void *malloc(size_t size)
 {
@@ -318,48 +346,99 @@ void *malloc(size_t size)
   if (pointer == NULL)
   {
     if (heap_start && bt_free(last))
-    { /*
-      pointer = mem_sbrk(blocksize);
-      heap_end = (void *)pointer + blocksize;
-      bt_make(pointer, blocksize, USED);
-      last = pointer;
-      return bt_payload(pointer);*/
-
-      ls_remove(last);
-      mem_sbrk(blocksize - bt_size(last));
-      heap_end = (void *)heap_end + blocksize - bt_size(last);
-      bt_make(last, blocksize, USED);
-      return bt_payload(last);
-    }
-    else
     {
-      pointer = mem_sbrk(blocksize);
-      if ((long)pointer < 0)
-        return NULL;
-      if (!heap_start)
-        heap_start = pointer;
-      last = pointer;
-      heap_end = (void *)pointer + blocksize;
-      bt_make(pointer, blocksize, USED);
+      ls_remove(last);
+      if (blocksize > 256)
+      {
+        mem_sbrk(blocksize - bt_size(last));
+        heap_end = (void *)heap_end + blocksize - bt_size(last);
+        bt_make(last, blocksize, USED);
+        return bt_payload(last);
+      }
+      else //male bloki, przypadek z kontenerami
+      {
+        mem_sbrk(containersize(blocksize) - bt_size(last));
+        heap_end = (void *)heap_end + containersize(blocksize) - bt_size(last);
+        bt_make(last, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
+        bt_make(last + blocksize, containersize(blocksize) - blocksize, FREE | CONTAINER);
+        ls_add(last + blocksize, blocksize);
+        last += blocksize;
+      }
+    }
+    else // pusta sterta lub na koncu sterty nie ma wolnego bloku
+    {
+      if (blocksize > 256)
+      {
+        pointer = mem_sbrk(blocksize);
+        if ((long)pointer < 0)
+          return NULL;
+        if (!heap_start)
+          heap_start = pointer;
+        last = pointer;
+        heap_end = (void *)pointer + blocksize;
+        bt_make(pointer, blocksize, USED);
+      }
+      else //male bloki, przypadek z kontenerami
+      {
+        pointer = mem_sbrk(containersize(blocksize));
+        if ((long)pointer < 0)
+          return NULL;
+        if (!heap_start)
+          heap_start = pointer;
+        heap_end = (void *)pointer + containersize(blocksize);
+        bt_make(pointer, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
+        bt_make(pointer + blocksize, containersize(blocksize) - blocksize, FREE | CONTAINER);
+        ls_add(pointer + blocksize, blocksize);
+        last = pointer + blocksize;
+      }
     }
   }
   else // pointer!=NULL
   {
     size_t nonused_size = bt_size(pointer) - blocksize;
-    if (nonused_size < ALIGNMENT)
+    if (nonused_size < ALIGNMENT) //bedzie tak samo dla malych jak i duzych blokow
     {
       ls_remove(pointer);
-      bt_make(pointer, bt_size(pointer), USED);
+      bt_make(pointer, bt_size(pointer), USED | bt_container(pointer) | bt_first_in_container(pointer));
     }
     else
     {
       ls_remove(pointer);
-      bt_make(pointer, blocksize, USED);
-      word_t *nonused_pointer = (void *)pointer + blocksize;
-      bt_make(nonused_pointer, nonused_size, FREE);
-      ls_add(nonused_pointer);
-      if (last == pointer)
-        last = nonused_pointer;
+      if (blocksize > 256)
+      {
+        bt_make(pointer, blocksize, USED);
+        word_t *nonused_pointer = (void *)pointer + blocksize;
+        bt_make(nonused_pointer, nonused_size, FREE);
+        ls_add(nonused_pointer, 0);
+        if (last == pointer)
+          last = nonused_pointer;
+      }
+      else //male bloki, przypadek z kontenerami
+      {
+        if (bt_container(pointer)) //znalezlismy wolne miejsce w kontenerze na blok rozmiaru blocksize
+        {
+          bt_make(pointer, blocksize, USED | CONTAINER | bt_first_in_container(pointer));
+          word_t *nonused_pointer = (void *)pointer + blocksize;
+          bt_make(nonused_pointer, nonused_size, FREE | CONTAINER);
+          ls_add(nonused_pointer, blocksize);
+          if (last == pointer)
+            last = nonused_pointer;
+        }
+        else //nie znalezlismy pasujacego kontenera, ale na jednej z list znalezlismy wystarczajace miejsce na nowy kontener
+        {
+          // ten przypadek jest najbardziej trikowy, powstaja tu trzy rozne bloki
+          size_t noncontained_size = bt_size(pointer) - containersize(blocksize);
+          word_t *nonused_pointer = (void *)pointer + blocksize;
+          word_t *noncontained_pointer = (void *)pointer + containersize(blocksize);
+          bt_make(pointer, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
+          bt_make(nonused_pointer, containersize(blocksize) - blocksize, FREE | CONTAINER);
+          bt_make(noncontained_pointer, noncontained_size, FREE);
+          ls_add(nonused_pointer, blocksize);
+          ls_add(noncontained_pointer, 0);
+          if (last == pointer)
+            last = noncontained_pointer;
+        }
+      }
     }
   }
   return bt_payload(pointer);
@@ -374,10 +453,11 @@ void free(void *ptr)
   word_t *header = bt_fromptr(ptr);
   if (bt_free(header))
     return;
-  size_t new_size = bt_size(header);
+  size_t old_size = bt_size(header);
+  size_t new_size = old_size;
   word_t *prev_header = bt_prev(header);
   word_t *next_header = bt_next(header);
-  int next_is_free = next_header && bt_free(next_header);
+  int next_is_free = next_header && bt_free(next_header) && (());
   int prev_is_free = prev_header && bt_free(prev_header);
   if (next_is_free && prev_is_free)
   {
@@ -412,9 +492,6 @@ void free(void *ptr)
     bt_make(header, new_size, FREE); // new_size to stara dlugosc w tym przypadku
     ls_add(header);
   }
-  //msg("++++++++++++++++++++++EMERGENCY CHECKHEAP+++++++++++++++\n");
-  //mm_checkheap(1);
-  //msg("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n");
 }
 
 /* --=[ realloc ]=---------------------------------------------------------- */
