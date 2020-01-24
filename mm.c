@@ -263,7 +263,6 @@ int mm_init(void)
 
 /* --=[ malloc ]=----------------------------------------------------------- */
 
-#if 1
 /* First fit startegy. */
 static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie payloadu
 {
@@ -287,12 +286,6 @@ static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie 
   }
   return NULL;
 }
-#else
-/* Best fit startegy. */
-static word_t *find_fit(size_t reqsz)
-{
-}
-#endif
 
 void *malloc(size_t size)
 {
