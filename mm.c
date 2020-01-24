@@ -51,7 +51,7 @@ static word_t *last;       /* Points at last block */
 //static word_t *list_last;  /* Address of the last free block */
 
 static word_t *free_lists;
-static const int maxindex = 10; //free_lists[10] to lista blokow >= 8KB
+static const int maxindex = 258;
 
 /* --=[ boundary tag handling ]=-------------------------------------------- */
 
@@ -167,6 +167,10 @@ static inline word_t ls_offfromaddr(word_t *pointer)
 
 static inline int ls_indexfromsize(size_t size)
 {
+
+  //exponential version
+
+  /*
   size >>= 4;
   long long index;
   asm("bsr %1, %0\n"
@@ -175,6 +179,15 @@ static inline int ls_indexfromsize(size_t size)
   if (size - ((long long)1 << index) != 0)
     index++;
   return index + 1 < maxindex ? index + 1 : maxindex;
+  */
+
+  //linear version
+
+  int index = size >> 4;
+  if (index >= maxindex)
+    return maxindex;
+  else
+    return index;
 }
 
 static inline void ls_add(word_t *block)
@@ -250,11 +263,11 @@ static void *morecore(size_t size)
 
 int mm_init(void)
 {
-  void *ptr = morecore(3 * ALIGNMENT - sizeof(word_t));
+  void *ptr = morecore((maxindex + 1) * 4); //wczesniej bylo:   3 * ALIGNMENT - sizeof(word_t)
   if (!ptr)
     return -1;
   heap_start = NULL;
-  heap_zero = memset(ptr, 0, 3 * ALIGNMENT - sizeof(word_t));
+  heap_zero = memset(ptr, 0, (maxindex + 1) * 4);
   free_lists = heap_zero;
   heap_end = NULL;
   last = NULL;
