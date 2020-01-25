@@ -48,7 +48,7 @@ static word_t *heap_end;   /* Address past last byte of last block */
 static word_t *last;       /* Points at last block */
 
 static word_t *free_lists;
-static const int maxindex = 25;
+static const int maxindex = 34;
 static const int containerexponent = 5;
 
 /* --=[ boundary tag handling ]=-------------------------------------------- */
@@ -212,9 +212,10 @@ static inline void ls_add(word_t *block, int index)
   }
 }
 
-static inline void ls_remove(word_t *block)
+static inline void ls_remove(word_t *block, int index)
 {
-  int index = ls_indexfromsize(bt_size(block));
+  if (index == 0)
+    index = ls_indexfromsize(bt_size(block));
   word_t *first_elem = ls_addrfromoff(free_lists[index]);
   word_t *last_elem = ls_addrfromoff(ls_prev(first_elem));
   if (block == first_elem && block == last_elem) // block jest jedynym blokiem na liscie
@@ -268,11 +269,11 @@ static void *morecore(size_t size)
 
 int mm_init(void)
 {
-  void *ptr = morecore(3 * ALIGNMENT - sizeof(word_t));
+  void *ptr = morecore(9 * ALIGNMENT - sizeof(word_t));
   if (!ptr)
     return -1;
   heap_start = NULL;
-  heap_zero = memset(ptr, 0, 3 * ALIGNMENT - sizeof(word_t));
+  heap_zero = memset(ptr, 0, 9 * ALIGNMENT - sizeof(word_t));
   free_lists = heap_zero;
   heap_end = NULL;
   last = NULL;
@@ -345,9 +346,9 @@ void *malloc(size_t size)
   word_t *pointer = find_fit(blocksize);
   if (pointer == NULL)
   {
-    if (heap_start && bt_free(last))
+    if (heap_start && bt_free(last) && !bt_container(last))
     {
-      ls_remove(last);
+      ls_remove(last, 0);
       if (blocksize > 256)
       {
         mem_sbrk(blocksize - bt_size(last));
@@ -360,8 +361,8 @@ void *malloc(size_t size)
         mem_sbrk(containersize(blocksize) - bt_size(last));
         heap_end = (void *)heap_end + containersize(blocksize) - bt_size(last);
         bt_make(last, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
-        bt_make(last + blocksize, containersize(blocksize) - blocksize, FREE | CONTAINER);
-        ls_add(last + blocksize, blocksize);
+        bt_make((void *)last + blocksize, containersize(blocksize) - blocksize, FREE | CONTAINER);
+        ls_add((void *)last + blocksize, ls_indexfromsize(blocksize));
         last += blocksize;
       }
     }
@@ -387,9 +388,9 @@ void *malloc(size_t size)
           heap_start = pointer;
         heap_end = (void *)pointer + containersize(blocksize);
         bt_make(pointer, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
-        bt_make(pointer + blocksize, containersize(blocksize) - blocksize, FREE | CONTAINER);
-        ls_add(pointer + blocksize, blocksize);
-        last = pointer + blocksize;
+        bt_make((void *)pointer + blocksize, containersize(blocksize) - blocksize, FREE | CONTAINER);
+        ls_add((void *)pointer + blocksize, ls_indexfromsize(blocksize));
+        last = (void *)pointer + blocksize;
       }
     }
   }
@@ -398,14 +399,14 @@ void *malloc(size_t size)
     size_t nonused_size = bt_size(pointer) - blocksize;
     if (nonused_size < ALIGNMENT) //bedzie tak samo dla malych jak i duzych blokow
     {
-      ls_remove(pointer);
+      ls_remove(pointer, 0);
       bt_make(pointer, bt_size(pointer), USED | bt_container(pointer) | bt_first_in_container(pointer));
     }
     else
     {
-      ls_remove(pointer);
       if (blocksize > 256)
       {
+        ls_remove(pointer, 0);
         bt_make(pointer, blocksize, USED);
         word_t *nonused_pointer = (void *)pointer + blocksize;
         bt_make(nonused_pointer, nonused_size, FREE);
@@ -417,23 +418,25 @@ void *malloc(size_t size)
       {
         if (bt_container(pointer)) //znalezlismy wolne miejsce w kontenerze na blok rozmiaru blocksize
         {
+          ls_remove(pointer, ls_indexfromsize(blocksize));
           bt_make(pointer, blocksize, USED | CONTAINER | bt_first_in_container(pointer));
           word_t *nonused_pointer = (void *)pointer + blocksize;
           bt_make(nonused_pointer, nonused_size, FREE | CONTAINER);
-          ls_add(nonused_pointer, blocksize);
+          ls_add(nonused_pointer, ls_indexfromsize(blocksize));
           if (last == pointer)
             last = nonused_pointer;
         }
         else //nie znalezlismy pasujacego kontenera, ale na jednej z list znalezlismy wystarczajace miejsce na nowy kontener
         {
           // ten przypadek jest najbardziej trikowy, powstaja tu trzy rozne bloki
+          ls_remove(pointer, 0);
           size_t noncontained_size = bt_size(pointer) - containersize(blocksize);
           word_t *nonused_pointer = (void *)pointer + blocksize;
           word_t *noncontained_pointer = (void *)pointer + containersize(blocksize);
           bt_make(pointer, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
           bt_make(nonused_pointer, containersize(blocksize) - blocksize, FREE | CONTAINER);
           bt_make(noncontained_pointer, noncontained_size, FREE);
-          ls_add(nonused_pointer, blocksize);
+          ls_add(nonused_pointer, ls_indexfromsize(blocksize));
           ls_add(noncontained_pointer, 0);
           if (last == pointer)
             last = noncontained_pointer;
@@ -455,43 +458,88 @@ void free(void *ptr)
     return;
   size_t old_size = bt_size(header);
   size_t new_size = old_size;
+  int index = 0;
+  int delete_container = 0;
+  word_t *container_to_delete = NULL;
   word_t *prev_header = bt_prev(header);
   word_t *next_header = bt_next(header);
-  int next_is_free = next_header && bt_free(next_header) && (());
+  int next_is_free = next_header && bt_free(next_header);
+  next_is_free = next_is_free && ((bt_container(header) && bt_container(next_header)) || (!bt_container(header) && !bt_container(next_header)));
+
   int prev_is_free = prev_header && bt_free(prev_header);
+  prev_is_free = prev_is_free && ((bt_container(header) && bt_container(prev_header)) || (!bt_container(header) && !bt_container(prev_header)));
+
+  if (bt_container(header))
+  {
+    prev_is_free = prev_is_free && !bt_first_in_container(header);
+    next_is_free = next_is_free && !bt_first_in_container(next_header);
+    index = ls_indexfromsize(new_size);
+  }
+
   if (next_is_free && prev_is_free)
   {
     if (next_header == last)
       last = prev_header;
-    ls_remove(prev_header);
-    ls_remove(next_header);
+    ls_remove(prev_header, index);
+    ls_remove(next_header, index);
     new_size += bt_size(prev_header) + bt_size(next_header);
-    bt_make(prev_header, new_size, FREE);
-    ls_add(prev_header);
+    bt_make(prev_header, new_size, FREE | bt_container(header) | bt_first_in_container(prev_header));
+    if (bt_container(prev_header) && (new_size == containersize(old_size)))
+    {
+      bt_make(prev_header, new_size, USED);
+      delete_container = 1;
+      container_to_delete = prev_header;
+    }
+    else
+      ls_add(prev_header, index);
   }
   else if (next_is_free)
   {
     if (next_header == last)
       last = header;
-    ls_remove(next_header);
+    ls_remove(next_header, index);
     new_size += bt_size(next_header);
-    bt_make(header, new_size, FREE);
-    ls_add(header);
+    bt_make(header, new_size, FREE | bt_container(header) | bt_first_in_container(header));
+    if (bt_container(header) && (new_size == containersize(old_size)))
+    {
+      bt_make(header, new_size, USED);
+      delete_container = 1;
+      container_to_delete = header;
+    }
+    else
+      ls_add(header, index);
   }
   else if (prev_is_free)
   {
     if (header == last)
       last = prev_header;
-    ls_remove(prev_header);
+    ls_remove(prev_header, index);
     new_size += bt_size(prev_header);
-    bt_make(prev_header, new_size, FREE);
-    ls_add(prev_header);
+    bt_make(prev_header, new_size, FREE | bt_container(header) | bt_first_in_container(prev_header));
+    if (bt_container(prev_header) && (new_size == containersize(old_size)))
+    {
+      bt_make(prev_header, new_size, USED);
+      delete_container = 1;
+      container_to_delete = prev_header;
+    }
+    else
+      ls_add(prev_header, index);
   }
   else //no adjacent free blocks
   {
-    bt_make(header, new_size, FREE); // new_size to stara dlugosc w tym przypadku
-    ls_add(header);
+    bt_make(header, new_size, FREE | bt_container(header) | bt_first_in_container(header)); // new_size to stara dlugosc w tym przypadku
+    if (bt_container(header) && (new_size == containersize(old_size)))
+    {
+      bt_make(header, new_size, USED);
+      delete_container = 1;
+      container_to_delete = header;
+    }
+    else
+      ls_add(header, index);
   }
+
+  if (delete_container)
+    free(bt_payload(container_to_delete));
 }
 
 /* --=[ realloc ]=---------------------------------------------------------- */
@@ -514,84 +562,104 @@ void *realloc(void *old_ptr, size_t size)
   word_t *next_boundary = bt_next(boundary);
   word_t *prev_boundary = bt_prev(boundary);
   size_t blocksize = blksz(size);
+
+  if (bt_container(boundary))
+  {
+    if (blocksize <= bt_size(boundary))
+      return old_ptr;
+    else
+    {
+      size_t newsize = (size > 2 * bt_size(boundary) - 4 * sizeof(word_t)) ? size : 2 * bt_size(boundary) - 4 * sizeof(word_t);
+      void *new_ptr = malloc(newsize);
+      if (!new_ptr)
+        return NULL;
+      memcpy(new_ptr, old_ptr, bt_size(boundary) - (sizeof(word_t) << 1));
+      free(old_ptr);
+      return new_ptr;
+    }
+  }
+
+  int next_is_free = next_boundary && bt_free(next_boundary) && !bt_container(next_boundary);
+  int prev_is_free = prev_boundary && bt_free(prev_boundary) && !bt_container(prev_boundary);
+
   if (blocksize > bt_size(boundary))
   {
-    if (next_boundary && bt_free(next_boundary) && next_boundary == last && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) < blocksize)
+    if (next_is_free && next_boundary == last && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) < blocksize)
     {
-      ls_remove(next_boundary);
+      ls_remove(next_boundary, 0);
       mem_sbrk(blocksize - (size_t)bt_size(boundary) - (size_t)bt_size(next_boundary));
       heap_end = (void *)heap_end + blocksize - (size_t)bt_size(boundary) - (size_t)bt_size(next_boundary);
       last = boundary;
       bt_make(boundary, blocksize, USED);
       return old_ptr;
     }
-    else if (next_boundary && bt_free(next_boundary) && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
+    else if (next_is_free && (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
     {
       size_t nonused_size = bt_size(boundary) + bt_size(next_boundary) - blocksize;
       if (nonused_size < ALIGNMENT)
       {
         if (last == next_boundary)
           last = boundary;
-        ls_remove(next_boundary);
+        ls_remove(next_boundary, 0);
         bt_make(boundary, nonused_size + blocksize, USED);
       }
       else
       {
-        ls_remove(next_boundary);
+        ls_remove(next_boundary, 0);
         bt_make(boundary, blocksize, USED);
         word_t *nonused_pointer = (void *)boundary + blocksize;
         bt_make(nonused_pointer, nonused_size, FREE);
-        ls_add(nonused_pointer);
+        ls_add(nonused_pointer, 0);
         if (last == next_boundary)
           last = nonused_pointer;
       }
       return old_ptr;
     }
-    else if (next_boundary && prev_boundary && bt_free(next_boundary) && bt_free(prev_boundary) && (size_t)bt_size(boundary) + (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
+    else if (next_is_free && prev_is_free && (size_t)bt_size(boundary) + (size_t)bt_size(boundary) + (size_t)bt_size(next_boundary) >= blocksize)
     {
       size_t nonused_size = bt_size(prev_boundary) + bt_size(boundary) + bt_size(next_boundary) - blocksize;
       if (nonused_size < ALIGNMENT)
       {
         if (last == next_boundary)
           last = prev_boundary;
-        ls_remove(prev_boundary);
-        ls_remove(next_boundary);
+        ls_remove(prev_boundary, 0);
+        ls_remove(next_boundary, 0);
         memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
         bt_make(prev_boundary, blocksize + nonused_size, USED);
       }
       else
       {
         word_t *nonused_pointer = (void *)prev_boundary + blocksize;
-        ls_remove(prev_boundary);
-        ls_remove(next_boundary);
+        ls_remove(prev_boundary, 0);
+        ls_remove(next_boundary, 0);
         memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
         bt_make(prev_boundary, blocksize, USED);
         bt_make(nonused_pointer, nonused_size, FREE);
-        ls_add(nonused_pointer);
+        ls_add(nonused_pointer, 0);
         if (last == next_boundary)
           last = nonused_pointer;
       }
       return bt_payload(prev_boundary);
     }
-    else if (prev_boundary && bt_free(prev_boundary) && (size_t)bt_size(prev_boundary) + (size_t)bt_size(boundary) >= blocksize)
+    else if (prev_is_free && (size_t)bt_size(prev_boundary) + (size_t)bt_size(boundary) >= blocksize)
     {
       size_t nonused_size = bt_size(prev_boundary) + bt_size(boundary) - blocksize;
       if (nonused_size < ALIGNMENT)
       {
         if (last == boundary)
           last = prev_boundary;
-        ls_remove(prev_boundary);
+        ls_remove(prev_boundary, 0);
         memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
         bt_make(prev_boundary, blocksize + nonused_size, USED);
       }
       else
       {
         word_t *nonused_pointer = (void *)prev_boundary + blocksize;
-        ls_remove(prev_boundary);
+        ls_remove(prev_boundary, 0);
         memcpy(bt_payload(prev_boundary), bt_payload(boundary), bt_size(boundary) - 2 * sizeof(word_t));
         bt_make(prev_boundary, blocksize, USED);
         bt_make(nonused_pointer, nonused_size, FREE);
-        ls_add(nonused_pointer);
+        ls_add(nonused_pointer, 0);
         if (last == boundary)
           last = nonused_pointer;
       }
@@ -599,7 +667,6 @@ void *realloc(void *old_ptr, size_t size)
     }
     else
     {
-      //TODO: MOZNA ZOPTYMALIZOWAC
       size_t newsize = (size > 2 * bt_size(boundary) - 4 * sizeof(word_t)) ? size : 2 * bt_size(boundary) - 4 * sizeof(word_t);
       void *new_ptr = malloc(newsize);
       if (!new_ptr)
@@ -620,7 +687,7 @@ void *realloc(void *old_ptr, size_t size)
         last = boundary + blocksize;
       word_t *nonused_pointer = (void *)boundary + blocksize;
       bt_make(nonused_pointer, bt_size(boundary) + bt_size(next_boundary) - blocksize, FREE);
-      ls_add(nonused_pointer);
+      ls_add(nonused_pointer, 0);
     }
     else //zauwazmy, ze bt_size(boundary)-blocksize jest wielkosci co najmniej ALIGMENT, bo kazdy z nich jest wielokrotnoscia ALIGMENT
     {
@@ -628,7 +695,7 @@ void *realloc(void *old_ptr, size_t size)
       if (last == boundary)
         last = new_block;
       bt_make(new_block, bt_size(boundary) - blocksize, FREE);
-      ls_add(new_block);
+      ls_add(new_block, 0);
     }
     return old_ptr;
   }
@@ -660,7 +727,10 @@ void mm_checkheap(int verbose)
     msg("last:%ld heap_end:%ld\nheap_zero:%ld\n", (void *)last - (void *)heap_start, (void *)heap_end - (void *)heap_start, (long int)heap_zero);
     int counter = 0;
     for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i), counter++)
-      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld,prev:%d,next:%d,index:%d\n", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start, ls_prev(i), ls_next(i), ls_indexfromsize(bt_size(i)));
+    {
+      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld,prev:%d,next:%d,index:%d", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start, ls_prev(i), ls_next(i), ls_indexfromsize(bt_size(i)));
+      msg(",iscont:%d,isfirstofcont:%d\n", bt_container(i), bt_first_in_container(i));
+    }
     msg("-------------------------------------------\n");
   }
 
