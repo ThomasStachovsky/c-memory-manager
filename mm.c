@@ -3,6 +3,61 @@ Tomasz Stachowski, 309675
 Jestem jedynym autorem kodu zrodlowego. (zaznaczam, ze korzystam z dolaczonego szkieletu)
 */
 
+/*
+Opisy wygladu zajetych i nowych blokow, oraz opis dzialania przydzialu i zwalniania bloku.
+
+Zajety blok:
+Zajety blok wyglada tak:  | header | payload + padding | footer |
+Header to czterobajtowe slowo znajdujace sie na poczatku bloku. Zawiera w sobie adres bloku na stercie. 
+Poniewaz rozmiary wszystkich blokow sa podzielne przez 16, mozemy zagospodarowac najnizsze bity headera i trzymac tam flagi
+informujace o bloku. Header zajetego bloku ma flage USED oraz potencjalnie CONTAINER i FIRST_IN_CONTAINER.
+(Definicja kontenerów znajduje sie nizej w tym komentarzu.)
+Payload to miejsce na dane uzytkownika. Poniewaz wielkosc bloku musi byc podzielna przez 16, 
+to na prawo od payloadu potencjalnie znajduje sie padding.
+Footer to kopia headera znajdujaca sie w koncowym slowie bloku.
+
+Wolny blok:
+Wolny blok wyglada tak:  | header | prev | next | padding | footer |
+Header tak jak w przypadku zajetego bloku informuje o wielkosci bloku oraz o jego flagach. 
+Wolny blok ma ustawiona flage FREE oraz potencjalnie CONTAINER i FIRST_IN_CONTAINER.
+Prev to offset wgledem poczatku sterty (trzymanym w zmiennej heap_zero) na poprzedni blok na liscie wolnych blokow,
+do ktorej nalezy dany blok. (Wytlumaczenie dzialania list wolnych blokow ponizej w tym komentarzu)
+Next jest analogiczny do prev, ale trzyma offset na nastepny blok na liscie.
+Padding zajmuje zazwyczaj wiekszosc wolnego bloku: prev + next + padding to miejsce na dane uzytkownika kiedy blok zostanie zajety.
+Footer to kopia headera znajdujaca sie w koncowym slowie bloku.
+
+Kontener:
+Kontener to obszar w pamieci, ktory zarezerwowany jest na bloki konkretnego rozmiaru. 
+Mechanizm ten jest uzywany tylko dla malych blokow. 
+Przykladowo, chcemy zajac blok wielkosci 32B. Algorytm zarzadzania pamiecia moze zdecydowac sie na utworzenie kontenera 
+na bloki rozmiaru 32B. Oznacza to, ze wykorzystany zostanie blok wielkosci 32B * 2^containerexponent (gdzie containerexponent==5).
+Blok ten zostanie podzielony na dwa bloki:
+- Blok (o ktory prosil uzytkownik) wielkosci 32B oznaczony jako USED, CONTAINER oraz FIRST_IN_CONTAINER
+- Blok wielkosci 32B * 2^containerexponent - 32B oznaczony jako FREE oraz CONTAINER.
+Ten drugi blok mimo, ze jest wolny, to moze byc wykorzystywany tylko na potrzeby blokow wielkosci dokladnie 32B.
+Pomaga to w zmniejszaniu fragmentacji zewnetrznej na stercie.
+Jezeli w pewnym momencie caly obszar kontenera bedzie wolny, to kontener jest "usuwany" tj.
+sciagane jest z niego oznaczenie CONTAINER, a jego obszar jest dostepny dla blokow innego rozmiaru.
+(Flaga FIRST_IN_CONTAINER jest uzywana podczas podejmowania decyzji o laczeniu wolnych blokow w jeden - mianowicie nie chcemy
+niechcaco polaczyc dwoch kontenerow w jeden ani polaczyc kontenera z niekontenerem.)
+
+Listy wolnych blokow:
+W algorytmie wykorzystywane sa dwukierunkowe listy wolnych blokow. Na danej liscie wolnych blokow sa bloki o rozmiarach z konkretnego
+przedzialu. Dzieki temu algorytm wyszukujacy wolny blok danego rozmiaru dziala szybciej.
+(Wyjatkiem sa bloki, ktore sa oznaczone jako fragmenty kontenerow. Przykladowo, blok wielkosci 128B moze znalezc sie na liscie 
+blokow o wielkosci 16B pod warunkiem, ze jest on wolnym fragmentem kontenera na bloki rozmiaru 16B.)
+
+Wysokopoziomowy opis przydzialu bloku:
+Algorytm przeszukuje listy wolnych blokow w poszukiwaniu odpowiednio duzego wolnego bloku.
+Jezeli mu sie powiedzie, to blok ten jest usuwany ze swojej listy wolnych blokow i oznaczany jako zajety.
+W przeciwnym przypadku algorytm prosi o dodatkowe miejsce na stercie, aby zmiescic nowy blok.
+
+Wysokopoziomowy opis zwalniania bloku:
+Algorytm oznacza dany blok jako wolny oraz znajduje odpowiednia dla niego liste wolnych blokow, do ktorej jest dodawany.
+W przypadku, gdy na lewo/na prawo w pamieci od niego byly wolne bloki, algorytm moze zdecydowac sie na zlaczenie tych blokow,
+zanim doda je do odpowiedniej listy wolnych blokow (wplyw na decyzje ma informacja, czy te bloki sa fragmentami kontenerow).  
+*/
+
 #include <assert.h>
 #include <limits.h>
 #include <stdio.h>
@@ -52,7 +107,7 @@ static word_t *heap_end;   /* Adres pierwszego bajta po ostatnim bloku */
 static word_t *last;       /* Wskaznik na ostatni blok */
 static word_t *free_lists; /* Wskaznik na tablice list wolnych blokow, jest to tablica offsetow wzgledem heap_zero */
 
-/* Stale */
+/* Wartosci stale */
 static const int maxindex = 34;          /* Najwiekszy indeks w tablicy list wolnych blokow, free_lists[maxindex] to lista blokow >= 64MB */
 static const int containerexponent = 5;  /* Kontenery zawieraja 2^containerexponent blokow */
 static const int maxcontainedsize = 256; /* Maksymalna wielkosc bloku, dla ktorego rozpatrujemy alokacje kontenera */
@@ -841,7 +896,14 @@ void *calloc(size_t nmemb, size_t size)
   return new_ptr;
 }
 
-/* Funkcja sprawdzajaca poprawnosc danych algorytmu zarzadzania pamiecia. */
+/* 
+Funkcja sprawdzajaca poprawnosc danych algorytmu zarzadzania pamiecia. 
+Sprawdzane sa niezmienniki, ktore sa wytlumaczone w tresci komunikatow o bledach.
+Zaimplementowalem kontenery na bloki, co troche zmienia wyglad poprawnej sterty. Przyklady na to, co mam na mysli:
+- Dwa wolne bloki MOGA stac obok siebie - warunkiem jest to, ze co najmniej jeden z nich jest fragmentem kontenera.
+- Na liscie wolnych blokow rozmiaru maksymalnie x MOGA byc bloki wieksze niz x - warunkiem jest to, 
+ze takie bloki sa fragmentami kontenerow trzymajacych bloki rozmiaru x.
+*/
 void mm_checkheap(int verbose)
 {
   void *prev_i = NULL;
@@ -854,9 +916,6 @@ void mm_checkheap(int verbose)
     if (bt_footer(i) >= heap_end)
       msg("[%d] CHECKHEAP ERROR: FOOTER OUTSIDE HEAP\n", counter);
 
-    if (bt_size(i) % 16)
-      msg("[%d] CHECKHEAP ERROR: SIZE NOT DIVISIBLE BY 16\n", counter);
-
     if (!bt_container(i) && bt_first_in_container(i))
       msg("[%d] CHECKHEAP ERROR: BLOCK NOT IN A CONTAINER BUT MARKED AS FIRST IN CONTAINER\n", counter);
 
@@ -867,7 +926,7 @@ void mm_checkheap(int verbose)
       msg("[%d] CHECKHEAP ERROR: SIZE NOT DIVISIBLE BY 16\n", counter);
 
     if (bt_container(i) && bt_size(i) > containersize(maxcontainedsize))
-      msg("[%d] CHECKHEAP ERROR: SIZE NOT DIVISIBLE BY 16\n", counter);
+      msg("[%d] CHECKHEAP ERROR: CONTAINER BIGGER THAN IT IS POSSIBLE\n", counter);
 
     if ((long)bt_payload(i) % 16)
       msg("[%d] CHECKHEAP ERROR: PAYLOAD ADDRESS NOT DIVISIBLE BY 16\n", counter);
