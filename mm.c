@@ -50,6 +50,7 @@ static word_t *last;       /* Points at last block */
 static word_t *free_lists;
 static const int maxindex = 34;
 static const int containerexponent = 5;
+static const int maxcontainedsize = 256;
 
 /* --=[ boundary tag handling ]=-------------------------------------------- */
 
@@ -131,11 +132,6 @@ static inline word_t *bt_prev(word_t *bt)
   return prevheader;
 }
 
-static inline size_t bt_containersize(word_t *bt)
-{
-  return bt_size(bt) << containerexponent; // kontenery zawieraja po szesnascie blokow
-}
-
 /* Lists of free blocks aux functions */
 
 //It returns an offset!!!
@@ -172,7 +168,7 @@ static inline word_t ls_offfromaddr(word_t *pointer)
 
 static inline int ls_indexfromsize(size_t size)
 {
-  if (size <= 256)
+  if (size <= maxcontainedsize)
     return (size + ALIGNMENT - 1) >> 4; //return ceil(size/16);
 
   size >>= 4;
@@ -287,7 +283,7 @@ static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie 
 {
   int index = ls_indexfromsize(reqsz);
 
-  if (reqsz > 256)
+  if (reqsz > maxcontainedsize)
     while (index <= maxindex)
     {
       if (free_lists[index] == 0)
@@ -307,10 +303,13 @@ static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie 
     }
   else //przypadek dla blokow o malych rozmiarach tj. tych, dla ktorych rozpatrujemy kontenery
   {
-    if (free_lists[index] == 0) // nie znalezlismy bloku konkretnego rozmiaru, szukamy miejsca na kontener na bloki tego rozmiaru
+    if (free_lists[index] == 0) // nie znalezlismy bloku/kontenera konkretnego rozmiaru, szukamy miejsca na nowy kontener na bloki tego rozmiaru
     {
+      size_t old_reqsz = reqsz;
       reqsz = containersize(reqsz);
       index = ls_indexfromsize(reqsz);
+      int container_index = index;
+      word_t *backup = NULL;
       while (index <= maxindex)
       {
         if (free_lists[index] == 0)
@@ -325,10 +324,39 @@ static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie 
           if (bt_size(pointer) >= reqsz)
             return pointer;
           else
+          {
+            pointer = ls_addrfromoff(ls_prev(pointer));
+            if (bt_size(pointer) >= old_reqsz && backup == NULL)
+              backup = pointer;
+          }
+        while (pointer != last_elem);
+        index++;
+      }
+      // jezeli nie znajdziemy miejsca na kontener, to probujemy znalezc miejsce na pojedynczy blok
+      // taka probe juz podjelismy i wynik jest w zmiennej backup
+      // wtedy jednak przeszukiwalismy listy wolnych blokow poczynajac od listy na bardzo duze bloki(mieszczace cale kontenery)
+      // teraz przeszukamy mniejsze listy i sprobujemy znalezc blok lepszy backup(albo jakikolwiek jezeli jeszcze nie mamy zadnego)
+      index = ls_indexfromsize(old_reqsz);
+      while (index < container_index)
+      {
+        if (free_lists[index] == 0)
+        {
+          index++;
+          continue;
+        }
+        word_t *first_elem = ls_addrfromoff(free_lists[index]);
+        word_t *last_elem = ls_addrfromoff(ls_prev(first_elem));
+        word_t *pointer = last_elem;
+        do
+          if (bt_size(pointer) >= old_reqsz && !bt_container(pointer))
+            return pointer;
+          else
             pointer = ls_addrfromoff(ls_prev(pointer));
         while (pointer != last_elem);
         index++;
       }
+      if (backup)
+        return backup; //zwrocimy backup kiedy znajdziemy odpowiednio duzy blok na listach na bloki mieszczace cale kontenery, ale nie na mniejszych
     }
     else
       return ls_addrfromoff(free_lists[index]);
@@ -349,7 +377,7 @@ void *malloc(size_t size)
     if (heap_start && bt_free(last) && !bt_container(last))
     {
       ls_remove(last, 0);
-      if (blocksize > 256)
+      if (blocksize > maxcontainedsize)
       {
         mem_sbrk(blocksize - bt_size(last));
         heap_end = (void *)heap_end + blocksize - bt_size(last);
@@ -363,12 +391,14 @@ void *malloc(size_t size)
         bt_make(last, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
         bt_make((void *)last + blocksize, containersize(blocksize) - blocksize, FREE | CONTAINER);
         ls_add((void *)last + blocksize, ls_indexfromsize(blocksize));
-        last += blocksize;
+        word_t *old_last = last;
+        last = (void *)last + blocksize;
+        return bt_payload(old_last);
       }
     }
     else // pusta sterta lub na koncu sterty nie ma wolnego bloku
     {
-      if (blocksize > 256)
+      if (blocksize > maxcontainedsize)
       {
         pointer = mem_sbrk(blocksize);
         if ((long)pointer < 0)
@@ -397,6 +427,7 @@ void *malloc(size_t size)
   else // pointer!=NULL
   {
     size_t nonused_size = bt_size(pointer) - blocksize;
+    word_t *nonused_pointer = (void *)pointer + blocksize;
     if (nonused_size < ALIGNMENT) //bedzie tak samo dla malych jak i duzych blokow
     {
       ls_remove(pointer, 0);
@@ -404,11 +435,10 @@ void *malloc(size_t size)
     }
     else
     {
-      if (blocksize > 256)
+      if (blocksize > maxcontainedsize)
       {
         ls_remove(pointer, 0);
         bt_make(pointer, blocksize, USED);
-        word_t *nonused_pointer = (void *)pointer + blocksize;
         bt_make(nonused_pointer, nonused_size, FREE);
         ls_add(nonused_pointer, 0);
         if (last == pointer)
@@ -420,18 +450,16 @@ void *malloc(size_t size)
         {
           ls_remove(pointer, ls_indexfromsize(blocksize));
           bt_make(pointer, blocksize, USED | CONTAINER | bt_first_in_container(pointer));
-          word_t *nonused_pointer = (void *)pointer + blocksize;
           bt_make(nonused_pointer, nonused_size, FREE | CONTAINER);
           ls_add(nonused_pointer, ls_indexfromsize(blocksize));
           if (last == pointer)
             last = nonused_pointer;
         }
-        else //nie znalezlismy pasujacego kontenera, ale na jednej z list znalezlismy wystarczajace miejsce na nowy kontener
+        else if (bt_size(pointer) >= containersize(blocksize)) //nie znalezlismy pasujacego kontenera, ale na jednej z list znalezlismy wystarczajace miejsce na nowy kontener
         {
           // ten przypadek jest najbardziej trikowy, powstaja tu trzy rozne bloki
           ls_remove(pointer, 0);
           size_t noncontained_size = bt_size(pointer) - containersize(blocksize);
-          word_t *nonused_pointer = (void *)pointer + blocksize;
           word_t *noncontained_pointer = (void *)pointer + containersize(blocksize);
           bt_make(pointer, blocksize, USED | CONTAINER | FIRST_IN_CONTAINER);
           bt_make(nonused_pointer, containersize(blocksize) - blocksize, FREE | CONTAINER);
@@ -440,6 +468,15 @@ void *malloc(size_t size)
           ls_add(noncontained_pointer, 0);
           if (last == pointer)
             last = noncontained_pointer;
+        }
+        else //znalezlismy odpowiednio duzy wolny blok na przechowanie pojedynczego bloku wielkosci blocksize
+        {
+          ls_remove(pointer, 0);
+          bt_make(pointer, blocksize, USED);
+          bt_make(nonused_pointer, nonused_size, FREE);
+          ls_add(nonused_pointer, 0);
+          if (last == pointer)
+            last = nonused_pointer;
         }
       }
     }
@@ -570,11 +607,16 @@ void *realloc(void *old_ptr, size_t size)
     else
     {
       size_t newsize = (size > 2 * bt_size(boundary) - 4 * sizeof(word_t)) ? size : 2 * bt_size(boundary) - 4 * sizeof(word_t);
+      newsize = size;
+      word_t word1 = (*(word_t *)old_ptr);
+      word_t word2 = (*((word_t *)old_ptr + 1));
+      free(old_ptr);
       void *new_ptr = malloc(newsize);
       if (!new_ptr)
         return NULL;
-      memcpy(new_ptr, old_ptr, bt_size(boundary) - (sizeof(word_t) << 1));
-      free(old_ptr);
+      (*(word_t *)new_ptr) = word1;
+      (*((word_t *)new_ptr + 1)) = word2;
+      memcpy((word_t *)new_ptr + 2, (word_t *)old_ptr + 2, bt_size(boundary) - (sizeof(word_t) << 2));
       return new_ptr;
     }
   }
@@ -668,18 +710,21 @@ void *realloc(void *old_ptr, size_t size)
     else
     {
       size_t newsize = (size > 2 * bt_size(boundary) - 4 * sizeof(word_t)) ? size : 2 * bt_size(boundary) - 4 * sizeof(word_t);
+      newsize = size;
+      word_t word1 = (*(word_t *)old_ptr);
+      word_t word2 = (*((word_t *)old_ptr + 1));
+      free(old_ptr);
       void *new_ptr = malloc(newsize);
       if (!new_ptr)
         return NULL;
-      memcpy(new_ptr, old_ptr, bt_size(boundary) - (sizeof(word_t) << 1));
-      free(old_ptr);
+      (*(word_t *)new_ptr) = word1;
+      (*((word_t *)new_ptr + 1)) = word2;
+      memcpy((word_t *)new_ptr + 2, (word_t *)old_ptr + 2, bt_size(boundary) - (sizeof(word_t) << 2));
       return new_ptr;
     }
   }
   else if (blocksize < bt_size(boundary)) // oraz oczywiscie blocksize >= ALIGNMENT
   {
-    if (blocksize >= bt_size(boundary) / 2)
-      return old_ptr;
     bt_make(boundary, blocksize, USED);
     if (next_boundary && bt_free(next_boundary))
     {
@@ -715,9 +760,14 @@ void *calloc(size_t nmemb, size_t size)
 }
 
 /* --=[ mm_checkheap ]=----------------------------------------------------- */
-
+static int nops = 0;
 void mm_checkheap(int verbose)
 {
+  if (nops < 15995)
+  {
+    nops++;
+    return;
+  }
 
   if (verbose)
   {
