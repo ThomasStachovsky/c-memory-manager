@@ -1,3 +1,8 @@
+/*
+Tomasz Stachowski, 309675
+Jestem jedynym autorem kodu zrodlowego. (zaznaczam, ze korzystam z dolaczonego szkieletu)
+*/
+
 #include <assert.h>
 #include <limits.h>
 #include <stdio.h>
@@ -10,8 +15,7 @@
 #include "mm.h"
 #include "memlib.h"
 
-/* If you want debugging output, use the following macro.
- * When you hand in, remove the #define DEBUG line. */
+/* Zostawie DEBUG zdefiniowany, mm_checkheap wypisuje u mnie komunikaty o bledach za pomoca funkcji msg(). */
 #define DEBUG
 #ifdef DEBUG
 #define debug(fmt, ...) printf("%s: " fmt "\n", __func__, __VA_ARGS__)
@@ -36,85 +40,93 @@ typedef int32_t word_t; /* Heap is bascially an array of 4-byte words. */
 
 typedef enum
 {
-  FREE = 0,               /* Block is free */
-  USED = 1,               /* Block is used */
-  CONTAINER = 2,          /* Block is a container */
-  FIRST_IN_CONTAINER = 4, /* Block is the first block in a container (used while checking whether to merge blocks or not) */
+  FREE = 0,               /* Blok jest wolny */
+  USED = 1,               /* Blok jest zajety */
+  CONTAINER = 2,          /* Blok jest kontenerem */
+  FIRST_IN_CONTAINER = 4, /* Blok jest pierwszym blokiem w kontenerze (potrzebne przy podejmowaniu decyzji, czy laczyc wolne bloki) */
 } bt_flags;
 
-static word_t *heap_zero;  /* Address of the first byte ever returned from mem_sbrk() */
-static word_t *heap_start; /* Address of the first block */
-static word_t *heap_end;   /* Address past last byte of last block */
-static word_t *last;       /* Points at last block */
+static word_t *heap_zero;  /* Adres pierwszego slowa zwroconego kiedykolwiek przez mem_sbrk() */
+static word_t *heap_start; /* Adres pierwszego bloku */
+static word_t *heap_end;   /* Adres pierwszego bajta po ostatnim bloku */
+static word_t *last;       /* Wskaznik na ostatni blok */
+static word_t *free_lists; /* Wskaznik na tablice list wolnych blokow, jest to tablica offsetow wzgledem heap_zero */
 
-static word_t *free_lists;
-static const int maxindex = 34;
-static const int containerexponent = 5;
-static const int maxcontainedsize = 256;
+/* Stale */
+static const int maxindex = 34;          /* Najwiekszy indeks w tablicy list wolnych blokow, free_lists[maxindex] to lista blokow >= 64MB */
+static const int containerexponent = 5;  /* Kontenery zawieraja 2^containerexponent blokow */
+static const int maxcontainedsize = 256; /* Maksymalna wielkosc bloku, dla ktorego rozpatrujemy alokacje kontenera */
 
-/* --=[ boundary tag handling ]=-------------------------------------------- */
+/* Funkcje pomocnicze do obslugi boundary tagow */
 
+/* Wielkosc bloku */
 static inline word_t bt_size(word_t *bt)
 {
   return ((*bt) >> 4) << 4;
 }
 
+/* Czy blok zajety */
 static inline int bt_used(word_t *bt)
 {
   return *bt & USED;
 }
 
+/* Czy blok wolny */
 static inline int bt_free(word_t *bt)
 {
   return !(*bt & USED);
 }
 
+/* Czy blok jest fragmentem kontenera */
 static inline int bt_container(word_t *bt)
 {
   return *bt & CONTAINER;
 }
 
+/* Czy blok jest wolnym blokiem i fragmentem kontenera */
 static inline int bt_freecontainer(word_t *bt)
 {
   return bt_container(bt) && bt_free(bt);
 }
 
+/* Czy blok jest zajetym blokiem i fragmentem kontenera */
 static inline int bt_usedcontainer(word_t *bt)
 {
   return bt_container(bt) && bt_used(bt);
 }
 
+/* Czy blok jest pierwszym blokiem w kontenerze */
 static inline int bt_first_in_container(word_t *bt)
 {
   return *bt & FIRST_IN_CONTAINER;
 }
 
-/* Given boundary tag address calculate it's buddy address. */
+/* Adres footera */
 static inline word_t *bt_footer(word_t *bt)
 {
   return (void *)bt + bt_size(bt) - sizeof(word_t);
 }
 
-/* Given payload pointer returns an address of boundary tag. */
+/* Wskaznik na poczatek bloku wziety ze wskaznika na payload */
 static inline word_t *bt_fromptr(void *ptr)
 {
   return (word_t *)ptr - 1;
 }
 
-/* Creates boundary tag(s) for given block. */
+/* Tworzy boundary tagi na podstawie wskaznika na blok, wielkosci bloku i flag */
 static inline void bt_make(word_t *bt, size_t size, bt_flags flags)
 {
   (*bt) = size | flags;
   (*bt_footer(bt)) = size | flags;
 }
 
-/* Returns address of payload. */
+/* Zwraca adres payloadu */
 static inline void *bt_payload(word_t *bt)
 {
   return bt + 1;
 }
 
-/* Returns address of next block or NULL. */
+/* Zwraca adres nastepnego bloku lub NULL */
 static inline word_t *bt_next(word_t *bt)
 {
   if (bt == last)
@@ -122,7 +134,7 @@ static inline word_t *bt_next(word_t *bt)
   return (void *)bt + bt_size(bt);
 }
 
-/* Returns address of previous block or NULL. */
+/* Zwraca adres poprzedniego bloku lub NULL */
 static inline word_t *bt_prev(word_t *bt)
 {
   if (heap_start == bt)
@@ -132,40 +144,51 @@ static inline word_t *bt_prev(word_t *bt)
   return prevheader;
 }
 
-/* Lists of free blocks aux functions */
+/* Funkcje pomocnicze do obslugi list wolnych blokow */
 
-//It returns an offset!!!
+/* Zwraca offset na poprzedni blok na liscie */
 static inline word_t ls_prev(word_t *ptr)
 {
   return *(ptr + 1);
 }
 
-//It returns an offset!!!
+/* Zwraca offset na nastepny blok na liscie */
 static inline word_t ls_next(word_t *ptr)
 {
   return *(ptr + 2);
 }
 
+/* Ustawia offset na poprzedni blok na liscie */
 static inline void ls_set_prev(word_t *ptr, word_t offset)
 {
   *(ptr + 1) = offset;
 }
 
+/* Ustawia offset na nastepny blok na liscie */
 static inline void ls_set_next(word_t *ptr, word_t offset)
 {
   *(ptr + 2) = offset;
 }
 
+/* Zwraca adres bloku na podstawie offsetu */
 static inline word_t *ls_addrfromoff(word_t offset)
 {
   return (word_t *)((void *)heap_zero + (uint64_t)offset);
 }
 
+/* Zwraca adres offset na podstawie adresu */
 static inline word_t ls_offfromaddr(word_t *pointer)
 {
   return (word_t)(uint64_t)((void *)pointer - (uint64_t)heap_zero);
 }
 
+/* 
+Zwraca indeks w tablicy wolnych blokow na podstawie wielkosci bloku.
+Dla blokow o wielkosci mniejszej niz maxcontainedsize indeks rosnie liniowo z wielkoscia tj.
+indeks dla wielkosci 16B to 1, indeks dla wielksoci 32B to 2, itd...
+Dla blokow o wielkosci wiekszej niz maxcontainedsize indeks rosnie logarytmicznie z wielksocia tj.
+indeks dla wielkosci 512B to 17, indeks dla wielkosci 1024B to 18 itd...
+*/
 static inline int ls_indexfromsize(size_t size)
 {
   if (size <= maxcontainedsize)
@@ -181,6 +204,11 @@ static inline int ls_indexfromsize(size_t size)
   return index + 12 < maxindex ? index + 12 : maxindex;
 }
 
+/* 
+Dodaje blok do odpowiedniej listy wolnych blokow
+Bloki w kontenerach maja pierwszenstwo, a wiec sa dodawane na poczatek listy.
+Inne wolne bloki sa dodawane na koniec listy.
+ */
 static inline void ls_add(word_t *block, int index)
 {
   if (index == 0)
@@ -208,6 +236,7 @@ static inline void ls_add(word_t *block, int index)
   }
 }
 
+/* Usuwa blok z odpowiedniej listy wolnych blokow */
 static inline void ls_remove(word_t *block, int index)
 {
   if (index == 0)
@@ -231,20 +260,23 @@ static inline void ls_remove(word_t *block, int index)
   }
 }
 
-/* --=[ miscellanous procedures ]=------------------------------------------ */
+/* Pozostale procedury pomocnicze */
 
+/* 
+Zwraca wielkosc kontenera blokow danego rozmiaru
+Kontener ma w sobie 2^containerexponent blokow.
+*/
 static inline size_t containersize(size_t size)
 {
   return size << containerexponent;
 }
 
-/* Calculates block size incl. header, footer & payload,
- * and aligns it to block boundary (ALIGNMENT). */
+/* Zwraca wielkosc bloku wraz z miejscem na header, payload/(prev,next), footer oraz padding aby wielkosc bloku byla poddzielna przez 16 */
 static inline size_t blksz(size_t size)
 {
   size_t payload_and_footer = size + sizeof(word_t);
   if (payload_and_footer % ALIGNMENT == 0)
-    return payload_and_footer + ALIGNMENT; //header + payload + footer + padding (wielkosci aligmnent minus jedno slowo)
+    return payload_and_footer + ALIGNMENT; //header + payload + footer + padding (wielkosci alignment minus jedno slowo)
   else if (payload_and_footer % ALIGNMENT == ALIGNMENT - sizeof(word_t))
     return sizeof(word_t) + payload_and_footer; //header + payload + footer + padding
   else if (payload_and_footer % ALIGNMENT > ALIGNMENT - sizeof(word_t))
@@ -253,6 +285,7 @@ static inline size_t blksz(size_t size)
     return sizeof(word_t) + payload_and_footer + ALIGNMENT - payload_and_footer % ALIGNMENT - sizeof(word_t);
 }
 
+/* Prosi o pamiec na stercie do trzymania tablicy offsetow na listy wolnych blokow */
 static void *morecore(size_t size)
 {
   void *ptr = mem_sbrk(size);
@@ -261,7 +294,7 @@ static void *morecore(size_t size)
   return ptr;
 }
 
-/* --=[ mm_init ]=---------------------------------------------------------- */
+/* Inicjaliuje sterte, ustawia zmienne globalne i tablice free_lists */
 
 int mm_init(void)
 {
@@ -276,9 +309,19 @@ int mm_init(void)
   return 0;
 }
 
-/* --=[ malloc ]=----------------------------------------------------------- */
+/* Funkcje malloc oraz pomocnicza find_fit znajdujaca wolny blok */
 
-/* First fit startegy. */
+/*
+Znajduje adres wolnego bloku na odpowiedniej liscie wolnych blokow.
+Na podstawie wielkosci bloku funkcja wyznacza liste wolnych blokow, od ktorych zaczac poszukiwania.
+Jezeli blok nie zostanie znaleziony, przeszukujemy listy wiekszych blokow. 
+Jezeli nadal nie znajdziemy miejsca na blok, to zwracamy NULL.
+Jezeli blok ma wielkosc mniejsza niz maxcontainedsize, to jezeli nie znalezlismy wolnego miejsca o wielkosci dokladnie takiej
+samej jak ten blok, to zaczynamy rownolegle szukac miejsca na ten blok, jak i na kontener mieszczacy ten blok na listach wiekszych blokow.
+Jezeli znajdziemy miejsce kontener na listach wiekszych blokow, to zwracamy wskaznik na to miejssce.
+W przeciwnym wypadku, jezeli znalezlismy miejsce na pojedynczy blok, to zwracamy wskaznik na to miejsce.
+W przeciwnym wypadku zwracamy NULL.
+*/
 static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie payloadu
 {
   int index = ls_indexfromsize(reqsz);
@@ -309,7 +352,7 @@ static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie 
       reqsz = containersize(reqsz);
       index = ls_indexfromsize(reqsz);
       int container_index = index;
-      word_t *backup = NULL;
+      word_t *backup = NULL; // jezeli nie znajdziemy miejsca na kontener, to tu potencjalnie znajduje sie miejsce na pojedynczy blok
       while (index <= maxindex)
       {
         if (free_lists[index] == 0)
@@ -335,7 +378,7 @@ static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie 
       // jezeli nie znajdziemy miejsca na kontener, to probujemy znalezc miejsce na pojedynczy blok
       // taka probe juz podjelismy i wynik jest w zmiennej backup
       // wtedy jednak przeszukiwalismy listy wolnych blokow poczynajac od listy na bardzo duze bloki(mieszczace cale kontenery)
-      // teraz przeszukamy mniejsze listy i sprobujemy znalezc blok lepszy backup(albo jakikolwiek jezeli jeszcze nie mamy zadnego)
+      // teraz przeszukamy mniejsze listy i sprobujemy znalezc blok lepszy od backup(albo jakikolwiek jezeli jeszcze nie mamy zadnego)
       index = ls_indexfromsize(old_reqsz);
       while (index < container_index)
       {
@@ -364,12 +407,21 @@ static word_t *find_fit(size_t reqsz) // reqsz to szukana wielkosc bloku, a nie 
   return NULL;
 }
 
+/*
+Funkcja malloc najpierw wywoluje find_fit.
+Jezeli find_fit zwrocil NULL, to malloc patrzy czy sterta jest pusta oraz czy ostatni blok jest wolny (i nie jest w kontenerze).
+Jezeli sterta jest pusta lub ostatni blok nie jest wolny (lub jest w kontenerze), to 
+malloc powieksza sterte o wielkosc bloku (w przypadku blokow wiekszych niz maxcontainedsize) 
+lub powieksza sterte o wielkosc kontenera na blok (w przypadku blokow mniejszych/rownych maxcontainedsize).
+Nastepnie nowe miejsce oznacza jako zajety blok, tudziez jako dwa bloki w nowym kontenerze, pierwszy zajety, a drugi wolny.
+Jezeli find_fit zwrocil adres jakiegos bloku, to malloc w zaleznosci od wielkosci bloku, na ktory dostal adres
+albo oznacza go calego jako zajety, albo dzieli go na czesci i oznacza je jako zajeta i wolna.
+W przypadku malych blokow malloc na podstawie wielkosci wolnego miejsca rozpatruje czy oznaczyc je jako kontener.
+Tak wiec np. w przypadku odpowiednio duzego wolnego miejsca, malloc stworzy trzy bloki:
+zajety blok wielkosci x, pozostale miejsce w kontenerze na bloki rozmiaru x, wolny blok.
+*/
 void *malloc(size_t size)
 {
-
-  //TODO: MONA OPTMALIZOWAC PRYPADKE ZE OSTATNI BLOK JEST PUSTY I ZA MALY
-
-  //TODO: MOZNA BY ZROBIC OSOBNA LISTE NA MALE BLOKI NP DO 32B
   size_t blocksize = blksz(size);
   word_t *pointer = find_fit(blocksize);
   if (pointer == NULL)
@@ -484,7 +536,16 @@ void *malloc(size_t size)
   return bt_payload(pointer);
 }
 
-/* --=[ free ]=------------------------------------------------------------- */
+/*
+Funkcja free zwalnia blok, na ktorego payload wskazuje ptr.
+Funkcja sprawdza tez, czy na lewo i na prawo w pamieci od zwalnianego bloku znajduja sie wolne bloki.
+W przypadku, gdy zwalniany blok jest w kontenerze, to funkcja sprawdza, 
+czy ewentualne wolne bloki na lewo i na prawo sa fragmentem tego samego kontenera.
+Jezeli na lewo lub na prawo w pamieci od zwalnianeo bloku mamy wolne bloki(ew. nalezace takze do tego samego kontenera),
+to funkcja laczy te bloki w jeden nowy wiekszy wolny blok.
+Jezeli zwalniany blok jest w kontenerze i okaze sie, ze po zwolnieniu caly kontener jest pusty,
+to kontener jest "usuwany" tj. nowy wolny blok nie jest juz oznaczony flaga CONTAINER. 
+*/
 
 void free(void *ptr)
 {
@@ -579,7 +640,28 @@ void free(void *ptr)
     free(bt_payload(container_to_delete));
 }
 
-/* --=[ realloc ]=---------------------------------------------------------- */
+/* 
+Funkcja realloc powieksza/zmniejsza blok.
+
+Jezeli blok jest w kontenerze, to jezeli blok ma byc zmniejszony, to funkcja nie robi nic,
+a jezeli blok ma byc zwiekszony to funkcja mallocuje go na nowo.
+
+Jezeli blok nie jest w kontenerze, to jezeli blok ma byc zwiekszony, to funkcja patrzy
+na bloki na lewo i na prawo od niego i sprawdza, 
+czy sa wolne oraz czy sumarycznie starcza na przechowanie nowego powiekszonego bloku.
+Jezeli sumaryczne miejsce blokow (danego, na lewo od niego i na prawo od niego) starcza na przechowanie powiekszonego bloku,
+to jest on odpowiednio kopiowany,przesuwany i funkcja zwraca na niego wskaznik.
+Niektore operacje maja wyzszy priorytet niz inne, tak aby kopiowanie pamieci odbylo sie tylko, jezeli jest niezbedne.
+Przykladowo, jezeli powiekszony blok miesci sie w starym bloku + bloku na prawo od niego,
+to algorytm nawet nie sprawdzi, czy blok na lewo jest wolny.
+Jezeli okaze sie, ze powiekszony blok nie miesci sie w sumie wolnych blokow naokolo danego bloku,
+to funkcja mallocuje go na nowo.
+Duza optymalizacja jest to, ze gdy funkcja realloc mallocuje blok na nowo, to najpierw wykonywany jest free, a dopiero potem malloc.
+Funkcja free nadpisuje payload starego bloku dwoma offsetami na adresy blokow na liscie wolnych blokow,
+tak wiec trzeba przechowac dwa slowa z bloku w zmiennych pomocniczych, a dopiero potem wywolac free.
+
+W przypadku gdy blok jest zmniejszany i nie jest kontenerem, to zmniejszany jest w miejscu.
+*/
 
 void *realloc(void *old_ptr, size_t size)
 {
@@ -748,7 +830,7 @@ void *realloc(void *old_ptr, size_t size)
     return old_ptr;
 }
 
-/* --=[ calloc ]=----------------------------------------------------------- */
+/* Funkcja alokuje pamiec za pomoca malloc i zeruje ja */
 
 void *calloc(size_t nmemb, size_t size)
 {
@@ -759,26 +841,9 @@ void *calloc(size_t nmemb, size_t size)
   return new_ptr;
 }
 
-/* --=[ mm_checkheap ]=----------------------------------------------------- */
+/* Funkcja sprawdzajaca poprawnosc danych algorytmu zarzadzania pamiecia. */
 void mm_checkheap(int verbose)
 {
-  if (verbose)
-  {
-    msg("%d %d %d %ld", ls_indexfromsize(blksz(128)), ls_indexfromsize(blksz(112)), ls_indexfromsize(32), blksz(128));
-    msg("HEAP STRUCTURE\n");
-    msg("hs-he:%ld\n", (uint64_t)((void *)heap_start - (uint64_t)heap_zero));
-    msg("last:%ld heap_end:%ld\nheap_zero:%ld\n", (void *)last - (void *)heap_start, (void *)heap_end - (void *)heap_start, (long int)heap_zero);
-    int counter = 0;
-    for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i), counter++)
-    {
-      msg("[%d] header:%d footer:%d size:%d isfree:%d isused:%d islast:%d, Bfirst:%ld,Blast:%ld,prev:%d,next:%d,index:%d", counter, (*(word_t *)i), (*bt_footer(i)), bt_size(i), bt_free(i), bt_used(i), last == (word_t *)i ? 1 : 0, i - (void *)heap_start, (void *)bt_footer(i) - (void *)heap_start, ls_prev(i), ls_next(i), ls_indexfromsize(bt_size(i)));
-      msg(",iscont:%d,isfirstofcont:%d\n", bt_container(i), bt_first_in_container(i));
-    }
-    msg("-------------------------------------------\n");
-  }
-
-  //wersja dla programu tylko z boundary tagami
-  // verbose moze byc rowne 0,1,2
   void *prev_i = NULL;
   int counter = 0;
   for (void *i = heap_start; i < (void *)heap_end; i += bt_size(i))
@@ -792,23 +857,42 @@ void mm_checkheap(int verbose)
     if (bt_size(i) % 16)
       msg("[%d] CHECKHEAP ERROR: SIZE NOT DIVISIBLE BY 16\n", counter);
 
-    if (prev_i && bt_free(prev_i) && bt_free(i))
-      msg("[%d] [%d] CHECKHEAP ERROR: TWO FREE BLOCKS ADJACENT\n", counter - 1, counter);
+    if (!bt_container(i) && bt_first_in_container(i))
+      msg("[%d] CHECKHEAP ERROR: BLOCK NOT IN A CONTAINER BUT MARKED AS FIRST IN CONTAINER\n", counter);
 
-    //trzeba jesxe srpawdac czy element jest free
-    /*if (i == list_start && ls_prev(i) != 0)
-      msg("[%d] CHECKHEAP ERROR: FIRST ELEMENT OF THE FREE LIST HAS NONZERO PREV\n", counter);
+    if (bt_free(i) && bt_used(i))
+      msg("[%d] CHECKHEAP ERROR: BLOCK BOTH FREE AND USED\n", counter);
 
-    if (i != list_start && ls_prev(i) == 0)
-      msg("[%d] CHECKHEAP ERROR: NONFIRST ELEMENT OF THE FREE LIST HAS ZERO PREV\n", counter);
+    if (bt_size(i) % 16)
+      msg("[%d] CHECKHEAP ERROR: SIZE NOT DIVISIBLE BY 16\n", counter);
 
-    if (i == list_last && ls_next(i) != 0)
-      msg("[%d] CHECKHEAP ERROR: LAST ELEMENT OF THE FREE LIST HAS NONZERO NEXT\n", counter);
+    if (bt_container(i) && bt_size(i) > containersize(maxcontainedsize))
+      msg("[%d] CHECKHEAP ERROR: SIZE NOT DIVISIBLE BY 16\n", counter);
 
-    if (i != list_last && ls_next(i) == 0)
-      msg("[%d] CHECKHEAP ERROR: NONLAST ELEMENT OF THE FREE LIST HAS ZERO NEXT\n", counter);
-      */
+    if ((long)bt_payload(i) % 16)
+      msg("[%d] CHECKHEAP ERROR: PAYLOAD ADDRESS NOT DIVISIBLE BY 16\n", counter);
+
+    if (prev_i && bt_free(prev_i) && bt_free(i) && !bt_container(i) && !bt_container(prev_i))
+      msg("[%d] [%d] CHECKHEAP ERROR: TWO FREE NONCONTAINER BLOCKS ADJACENT\n", counter - 1, counter);
     prev_i = i;
     counter++;
+  }
+
+  for (int index = 1; index <= maxindex; index++)
+  {
+    if (free_lists[index] == 0)
+    {
+      index++;
+      continue;
+    }
+    word_t *first_elem = ls_addrfromoff(free_lists[index]);
+    word_t *pointer = first_elem;
+    do
+    {
+      if (!bt_free(pointer))
+        msg("[Free Lists,index=%d] CHECKHEAP ERROR: Block on a free list is not free\n", index);
+      pointer = ls_addrfromoff(ls_next(pointer));
+    } while (pointer != first_elem);
+    index++;
   }
 }
