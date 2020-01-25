@@ -760,15 +760,8 @@ void *calloc(size_t nmemb, size_t size)
 }
 
 /* --=[ mm_checkheap ]=----------------------------------------------------- */
-static int nops = 0;
 void mm_checkheap(int verbose)
 {
-  if (nops < 15995)
-  {
-    nops++;
-    return;
-  }
-
   if (verbose)
   {
     msg("%d %d %d %ld", ls_indexfromsize(blksz(128)), ls_indexfromsize(blksz(112)), ls_indexfromsize(32), blksz(128));
